@@ -1,0 +1,72 @@
+TOP=../..
+
+-include ${TOP}/Makefile.conf
+
+
+# Paths from GIT to include in our source tar
+PATH_LIST          := linux common tools Makefile Makefile.ver TD-VERSION-GEN
+
+RPMBUILD_TREE      := $(shell pwd)/rpmbuild
+RPMBUILD_ARCH      := $(shell uname -m)
+MKDIR_P             = mkdir -p
+OUTDIRS             = BUILD RPMS SOURCES SPECS SRPMS
+TAR = tar --transform "s,^,teradimm-$(TERADIMM_VERSION)/,"
+
+
+all rpms: src.rpm
+	
+include ${TOP}/Makefile.ver
+TERADIMM_VERSION := $(subst -,_,${TERADIMM_VERSION_STRING})
+
+filelist: FORCE
+	@git ls-tree --name-only -r --full-tree HEAD ${PATH_LIST} > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+	
+%.gz: %
+	gzip -9 -v $<
+
+%.tar: VERSION filelist
+	$(TAR) -C ../.. -T filelist -cf $@.tmp
+	$(TAR) --append --file $@.tmp VERSION
+	mv $@.tmp $@
+	@rm -f $@.tmp
+
+
+VERSION: FORCE
+	@echo ${TERADIMM_VERSION_STRING} > $@.tmp
+	@echo ${TD_VER_REVISION} >> $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+
+
+.PHONY: rpmbuild-tree
+rpmbuild-tree: ${OUTDIRS}
+
+
+${OUTDIRS}:
+	${MKDIR_P} ${RPMBUILD_TREE}/$@
+
+$(RPMBUILD_TREE)/SOURCES/%: % rpmbuild-tree
+	cp $< $@
+
+$(RPMBUILD_TREE)/SOURCES/%.gz: %
+	gzip -9 -v -c $< > $@.tmp
+	mv $@.tmp $@
+
+$(RPMBUILD_TREE)/SPECS/%.spec: %.spec rpmbuild-tree
+	sed -e 's/@VERSION@/$(TERADIMM_VERSION)/g' $< > $@.tmp
+	mv $@.tmp $@
+
+src.rpm: $(RPMBUILD_TREE)/SPECS/teradimm.spec $(RPMBUILD_TREE)/SOURCES/teradimm-$(TERADIMM_VERSION).tar.gz
+	rpmbuild -bs -v \
+		--define='suppress_dist YesPlease' \
+		--define='%_topdir ${RPMBUILD_TREE}' \
+		--target=${RPMBUILD_ARCH} \
+		$<
+
+clean:
+	rm -f filelist *.tar *.tz
+
+.PHONY: FORCE
+	

@@ -1,0 +1,279 @@
+#!/bin/bash
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#     Copyright (c) 2013 Diablo Technologies Inc. (Diablo).             #
+#     All rights reserved.                                              #
+#                                                                       #
+#     This program is free software; you can redistribute it and/or     #
+#     modify it under the terms of the GNU General Public License       #
+#     as published by the Free Software Foundation; either version 2    #
+#     of the License, or (at your option) any later version located at  #
+#     <http://www.gnu.org/licenses/                                     # 
+#                                                                       #
+#     This program is distributed WITHOUT ANY WARRANTY; without even    #
+#     the implied warranty of MERCHANTABILITY or FITNESS FOR A          #
+#     PARTICULAR PURPOSE.  See the GNU General Public License for       # 
+#     more details.                                                     # 
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+set -e
+
+KERN=
+ARCH=x86
+SELF="$(basename $0)"
+TOPDIR="$(dirname $0)"
+TESTDIR="$TOPDIR/tests"
+TMPDIR=
+KVER=
+
+
+run_test=
+generate=false
+getversion=false
+declare -a symbol_names
+
+# ------------------------------------------------------------------------
+say() { echo >&2 "/*    $@    */" ; }
+warn() { echo >&2 "$SELF WARNING: $@" ; }
+die() { echo >&2 "$SELF ERROR: $@" ; exit 1 ; }
+
+# ------------------------------------------------------------------------
+testnames() {
+        for n in $( cd $TESTDIR && ls *.c ) ; do
+                echo ${n%.c}
+        done
+}
+
+checktest() {
+        test -f "$TESTDIR/$1.c"
+}
+
+testname2sym() {
+        echo "KABI__$1"
+}
+
+runtest() {
+        local name="$1"
+
+        say "running $name"
+        checktest "$name"
+
+        mkdir -p "$TMPDIR"
+        tmpout="$TMPDIR/$name"
+        rm -f "$tmpout"*
+
+	if [ -z $LINUX_PATH ]; then
+	        declare -a opts=(
+        	        -Os
+                	-isystem "$KERN/include"
+			-isystem "$KERN/include/uapi"
+			-isystem "$ARCH_PATH/include/generated"
+	                -I "$ARCH_PATH/include"
+                	-Wall -Werror
+	                -Werror-implicit-function-declaration
+                        -D"KBUILD_BASENAME="
+        	)
+	else
+	        declare -a opts=(
+        	        -Os
+                	-isystem "$KERN/include"
+			-isystem "$KERN/include/uapi"
+			-isystem "$ARCH_PATH/include/generated"
+	                -I "$ARCH_PATH/include"
+        	        -I "$LINUX_PATH/include"
+                	-Wall -Werror
+	                -Werror-implicit-function-declaration
+                        -fno-strict-aliasing
+        	)
+	fi
+
+        if [[ ! -e "$KERN/include/linux/kconfig.h" ]];then
+                opts=( ${opts[*]} -I "$TESTDIR" )
+        fi
+
+        declare -a autoconf_locations=(
+                linux/autoconf.h
+                generated/autoconf.h
+        )
+        for n in ${autoconf_locations[*]} ; do
+                [ -f "$KERN/include/$n" ] && opts=( ${opts[*]} -include $n )
+        done
+
+        (
+                set -x
+                gcc ${opts[*]} -o "$tmpout.E.c" -E "$TESTDIR/$1.c"
+                gcc ${opts[*]} -o "$tmpout.o"   -c "$TESTDIR/$1.c"
+
+        ) > "$tmpout.log" 2>&1
+
+        [ -f "$tmpout.o" ]
+}
+
+lookup_symbol() {
+        local symname="$1"
+
+        local -a try=( "/boot/System.map-$KVER" "$KERN/System.map" )
+        local map=
+        for f in ${try[*]} ; do
+                if [ -f "$f" ] ; then
+                        map="$f"
+                        break
+                fi
+        done
+
+        [ -f "$map" ] || die "no System.map file for $KVER kernel."
+
+        awk=awk
+        if ! [ -r "$map" ] ; then
+                warn "cannot read $map, trying with sudo"
+                awk="sudo awk"
+        fi
+
+        $awk "/[0-9a-f]+ . $symname\$/ { print \"0x\" \$1 ; exit }" "$map"
+}
+
+
+
+# ------------------------------------------------------------------------
+while [ -n "$1" ] ; do
+        case "$1" in
+            -h)
+                cat <<END
+$SELF [ -h ] [ -k <dir> ] [ -a <arch> ] [ -g ]
+
+-h                      - this help
+
+-k <kernel-build-dir>   - set kernel build dir (default: /lib/modules/\$CURRENT/build)
+-a <arch>               - set arch (default: x86)
+
+-l                      - list all tests
+-r <test>               - run one test
+
+-s <symbol names>       - list of symbols to lookup
+
+-t <tmp dir>            - directory for temporary output (default: ./tmp/<kver>)
+
+-v                      - get kernel version
+
+-g                      - generate header output (for all tests)
+
+END
+                exit 0
+                ;;
+            -k)
+                shift
+                KERN="$1"
+                [ -d "$KERN" ] || die "$KERN: not a directory"
+                ;;
+            -a)
+                shift
+                ARCH="$1"
+                ;;
+            -l)
+                testnames
+                exit 0
+                ;;
+            -r)
+                shift
+                run_test="$1"
+                checktest "$run_test" || die "$run_test: not a valid test"
+
+                ;;
+            -g)
+                generate=true
+                ;;
+            -v)
+                getversion=true
+                ;;
+            -s)
+                shift
+                symbol_names=( $1 )
+                ;;
+            -t)
+                shift
+                TMPDIR="$1"
+                ;;
+            *)
+                die "invalid option: $1"
+                ;;
+        esac
+        shift
+done
+
+if [ -z "$KERN" ] ; then
+        KERN=/lib/modules/$(uname -r)/build
+        warn "-k not specified, trying $KERN"
+fi
+[ -d "$KERN" ] || die "$KERN: not a directory"
+[ -f "$KERN"/include/linux/version.h -o \
+  -f "$KERN"/include/generated/uapi/linux/version.h ] || die "$KERN: not a linux kernel build tree"
+
+if [ -d "${KERN/build/}/source/arch/$ARCH" ]; then
+	ARCH_PATH=${KERN/build/}/source/arch/$ARCH
+	LINUX_PATH=${KERN/build/}/source
+elif [ -d "$KERN/arch/$ARCH" ]; then
+	ARCH_PATH=$KERN/arch/$ARCH
+elif [ -d "$KERN/arch/$ARCH"_64 ]; then
+        ARCH=x86_64
+        ARCH_PATH=$KERN/arch/$ARCH
+
+fi
+
+[ ! -z $ARCH_PATH ] || die "$ARCH: does not seem to be a valid architecture"
+
+if [ -f ${KERN}/.kernelvariables ]; then
+        KVER=$(awk '/override KERNELRELEASE = / { print $4 }' ${KERN}/.kernelvariables)
+elif [ -f ${KERN}/include/config/kernel.release ]; then
+        KVER=$(cat ${KERN}/include/config/kernel.release)
+else
+        KVER=$(cat ${KERN}/.kernelrelease)
+fi
+[ -z "$KVER" ] && die "cannot discern kernel version"
+
+[ -z "$TMPDIR" ] && TMPDIR="tmp/$KVER"
+
+if $getversion ; then
+        echo $KVER
+
+elif $generate ; then
+        echo "#ifndef __included_kabi_h__"
+        echo "#define __included_kabi_h__"
+        echo
+        say "kernel version is $KVER"
+        for s in ${symbol_names[@]} ; do
+                v=$(lookup_symbol $s)
+
+                echo "#define SYM_$s $v"
+        done
+        echo
+        for n in $(testnames) ; do
+                sym=$(testname2sym "$n")
+                if runtest $n ; then
+                        echo "#define ${sym/=/ }"
+                fi
+        done
+        echo
+        echo "#endif"
+
+elif [ -n "$run_test" ] ; then
+        if runtest $run_test ; then
+                say $run_test PASSES
+                exit 0
+        else
+                say $run_test FAILS
+                exit 1
+        fi
+
+elif [ ${#symbol_names} -gt 0 ] ; then
+
+        say "kernel version is $KVER"
+        for s in ${symbol_names[@]} ; do
+                v=$(lookup_symbol $s)
+
+                echo $s $v
+        done
+
+else
+        die "nothing to do"
+
+fi

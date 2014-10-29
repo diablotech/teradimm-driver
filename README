@@ -1,0 +1,21 @@
+To build the source:
+
+	make -C linux
+
+To build the src rpm:
+
+	make -C linux/rpm
+
+To build a binary rpm from the src rpm:
+
+	rpmbuild --rebuild -D'tools none' -D'kversion <kernel_version>' teradimm-1.5.0.41-1.src.rpm
+
+	where <kernel_version> is equal to the required kernel version, for which
+	there are kernel headers in /lib/modules/${kernel_version} directory.
+
+	For example:
+	   rpmbuild --rebuild -D'tools none' -D'kversion 2.6.32-431.el6' teradimm-1.5.0.41-1.src.rpm
+
+	Use 'uname -r' to get the kernel version of your machine, and remove
+	the .x86_64 suffix.
+

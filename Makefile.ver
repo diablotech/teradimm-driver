@@ -1,0 +1,12 @@
+ifeq (${TOP},)
+$(error TOP is not defined, define it before including Makefile.ver)
+endif
+
+.PHONY: FORCE_VER
+${TOP}/TD-VERSION-FILE: FORCE_VER
+	@$(SHELL_PATH) ${TOP}/TD-VERSION-GEN > $@.$$PPID
+	@cmp -s $@.$$PPID $@ || cat $@.$$PPID> $@
+	@rm -f $@.$$PPID
+
+
+-include ${TOP}/TD-VERSION-FILE

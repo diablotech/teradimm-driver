@@ -1,0 +1,112 @@
+default::
+
+ifeq ($(KVERSION),)
+KVERSION := $(shell uname -r)
+endif
+
+PWD     := $(shell pwd)
+TOP     := ${PWD}/../..
+
+include ${TOP}/Makefile.conf
+
+KDIR    ?= /lib/modules/$(KVERSION)/build
+MDIR    := ${KDIR}/../kernel/misc
+CMN     := ${TOP}/common/driver
+PROTO   := ${TOP}/common/util
+
+ifneq ($(BUILD_OS),vmware)
+KABI_DIR   := ${PWD}/../kabi
+KABI       := ${KABI_DIR}/kabi
+KABI_TESTS := $(wildcard ${KABI_DIR}/tests/*)
+endif
+
+
+STM_PATH     ?= $(HOME)/work/lab-tools/eval-c/drv
+
+KVER    ?= $(shell ${KABI} -v -k ${KDIR})
+ifeq (${KVER},)
+TERADIMM_KABI_H   := teradimm_kabi-unknown.h
+.PHONY: ${TERADIMM_KABI_H}
+else
+TERADIMM_KABI_H   := teradimm_kabi-${KVER}.h
+endif
+
+
+
+include ${TOP}/Makefile.ver
+
+TERADIMM_NEEDED_SYMBOL_NAMES := init_memory_mapping raw_pci_read raw_pci_write\
+	clflush_cache_range
+
+
+.PHONY: default tags clean distclean cleanlinks install install-links install-kmod
+.PHONY: ${TARGET}
+
+TARGET = teradimm.ko
+default:: ${TARGET}
+
+# kbuild only looks at files in current directory and ignores vpath, so 
+# we have to link files in from the common/driver directory
+${COMMON_SRCS}: %.c: ${CMN}/%.c
+	@echo "  LNK  $@"
+	@ln -fs $< $@
+
+${PROTOCOL_SRCS}: %.c: ${PROTO}/%.c
+	@echo "  LNK  $@"
+	@ln -fs $< $@
+
+OTHER_HEADERS = $(wildcard                   \
+		${TOP}/linux/driver/*.h      \
+		${TOP}/common/driver/*.h      \
+		${TOP}/common/util/*.h        \
+		${TOP}/common/util/*.h        \
+		)
+
+${TARGET}: ${TERADIMM_KABI_H} ${LINUX_SRCS} ${COMMON_SRCS} ${PROTOCOL_SRCS} ${STM_DEPS} ${TOP}/TD-VERSION-FILE ${TD_CONFIG_H} ${OTHER_HEADERS}
+	$(MAKE) -C $(KDIR) M=$(PWD) TERADIMM_VERSION=${TERADIMM_VERSION_STRING} \
+		TERADIMM_VERSION_DIGITS=${TERADIMM_VERSION_DIGITS} \
+		TERADIMM_REVISON=${TD_VER_REVISION} \
+		TERADIMM_KABI_H=${PWD}/${TERADIMM_KABI_H} \
+		TD_CONFIG_H=${PWD}/${TD_CONFIG_H}
+
+${TERADIMM_KABI_H}: ${KABI} ${KABI_TESTS}
+	${KABI} -g -k ${KDIR} -s "${TERADIMM_NEEDED_SYMBOL_NAMES}" > $@.tmp
+	mv $@.tmp $@
+
+Module.symvers: $(STM_PATH)/Module.symvers
+	cp $< $@
+
+tags cscope:
+	$(MAKE) -C .. $@
+
+cleanlinks:
+	-for c in ${COMMON_SRCS} ${PROTOCOL_SRCS}; do \
+		if [ -L $$c ] ; then \
+			rm -f $$c ; \
+		fi ; \
+	 done
+
+clean: cleanlinks
+	-rm -f *~ .*.cmd *.o *.ko ${TARGET}
+	-rm -f Module.symvers modules.order teradimm.mod.c
+	-rm -rf .tmp_versions
+
+distclean: clean
+	-rm -f teradimm_kabi-*.h
+	-rm -rf tmp
+
+
+install:
+install-links:
+
+install-kmod: ${TARGET}
+	install -b -m 0644 $^ ${MDIR}
+	depmod -a
+
+.PHONY: .gitignore
+.gitignore:
+	for f in $(sort ${COMMON_SRCS} ${PROTOCOL_SRCS}); do    \
+		echo $$f;                                       \
+	done     > $@.$$PPID
+	@cmp -s $@.$$PPID $@ || cat $@.$$PPID> $@
+	@rm -f $@.$$PPID

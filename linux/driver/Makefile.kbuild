@@ -1,0 +1,6 @@
+
+obj-$(CONFIG_BLK_DEV_TERADIMM)	+= teradimm.o
+teradimm-objs			:= ${LINUX_OBJS}
+teradimm-objs			+= ${COMMON_OBJS}
+teradimm-objs			+= ${PROTOCOL_OBJS}
+

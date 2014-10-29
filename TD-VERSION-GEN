@@ -1,0 +1,117 @@
+#!/bin/bash
+
+
+self=$(readlink -f $0)
+sdir=$(dirname $self)
+
+chr () {
+        [ ${1} -lt 256 ] || return 1
+        printf \\$(($1/64*100+$1%64/8*10+$1%8))
+}
+
+ord() {
+          LC_CTYPE=C printf '%d' "'$1"
+}
+
+
+format_version_string()
+{
+        #printf "%s%u.%u.%u%c%u%s"  "$@"
+        printf "%s%u.%u.%u%c%u%s"   "$TD_PREFIX" $TD_MAJOR $TD_MINOR $TD_PATCH $TD_BUILD_SEP $TD_BUILD $TD_BUILD_SUFFIX
+}
+format_version_digits()
+{
+        LOCAL_MAJOR_TYPE=$(($TD_TYPE*256))
+        printf "%u,%u,%u,%u"  $(($LOCAL_MAJOR_TYPE+$TD_MAJOR)) $TD_MINOR $TD_PATCH $TD_BUILD
+}
+
+REL_TAG_MATCH='r[.0-9]*'
+DEV_TAG_MATCH='v[.0-9]*'
+
+VER_FILE=${sdir:-.}/VERSION
+
+if [ -f $VER_FILE ]
+then
+        TERADIMM_VERSION_STRING=$(head -n 1 $VER_FILE)
+        TD_REVISON=$(tail -n 1 $VER_FILE)
+        
+        TD_PREFIX=${TERADIMM_VERSION_STRING%%[0-9]*}
+        TD_VERSION=${TERADIMM_VERSION_STRING#[A-F]}
+        
+        TD_TYPE=$(($(ord ${TD_PREFIX:-@} )-64))
+        eval $(echo $TD_VERSION | awk -F [.-] -- '{ printf "TD_MAJOR=%s\nTD_MINOR=%s\nTD_PATCH=%s\nTD_BUILD=%s\nTD_BUILD_SUFFIX=%s", $1, $2, $3, $4, $5; }')
+        
+        TERADIMM_VERSION_DIGITS=$(format_version_digits)
+else
+        if [ -n "$RELEASE_BUILD" ]
+        then
+                ## We are building a "jenkins" version
+                TD_VERSION=$(git describe --match $REL_TAG_MATCH | sed -e 's/^[a-z]//')
+                TD_REVISION=$(git rev-parse HEAD)
+        else        
+                ## Build a version string of our git "v" tags
+                TD_VERSION=$(git describe --match $DEV_TAG_MATCH | sed -e 's/^[a-z]//')
+                TD_REVISION=$(git rev-parse HEAD)
+        fi
+
+        eval $(echo $TD_VERSION | awk -F [.-] -- '{ printf "TD_MAJOR=%s\nTD_MINOR=%s\nTD_PATCH=%s\nTD_BUILD=%s\nTD_BUILD_SUFFIX=%s", $1, $2, $3, $4, $5; }')
+
+        if [ -n "$RELEASE_BUILD" ]
+        then
+                TD_BUILD=$RELEASE_BUILD
+                TD_BUILD_SUFFIX=
+        else
+                TD_BUILD_SUFFIX=-$TD_BUILD_SUFFIX
+        fi
+
+
+        case "${RELEASE_TYPE:0:1}" in
+                R)
+                        TD_PREFIX=""
+                        ;;
+                [ABCDEF])
+                        TD_PREFIX=${RELEASE_TYPE:0:1};
+                        ;;
+                *)      
+                        TD_PREFIX=D
+                        ;;
+
+        esac
+
+        TD_TYPE=$(($(ord ${TD_PREFIX:-@} )-64))
+
+        if [ -n "$TD_BUILD_SUFFIX" ]
+        then
+                TD_BUILD_SEP="-"
+        else
+                TD_BUILD_SEP="."
+        fi
+
+
+        TERADIMM_VERSION_STRING=$(format_version_string)
+        TERADIMM_VERSION_DIGITS=$(format_version_digits)
+
+fi
+
+
+(
+        echo "##"
+        echo "## TeraDIMM Version $TERADIMM_VERSION_STRING ($TERADIMM_VERSION_DIGITS)"
+        echo "##"
+        
+) 1>&2
+
+echo "TD_VER_PREFIX=$TD_PREFIX"
+echo "TD_VER_TYPE=$TD_TYPE"
+echo "TD_VER_MAJOR=$TD_MAJOR"
+echo "TD_VER_MINOR=$TD_MINOR"
+echo "TD_VER_PATCH=$TD_PATCH"
+echo "TD_VER_BUILD_SEP=$TD_BUILD_SEP"
+echo "TD_VER_BUILD=$TD_BUILD"
+echo "TD_VER_BUILD_SUFFIX=$TD_BUILD_SUFFIX"
+
+echo "TD_VER_BASE=$TD_VERSION"
+echo "TD_VER_REVISION=$TD_REVISION"
+
+echo "TERADIMM_VERSION_STRING=$TERADIMM_VERSION_STRING"
+echo "TERADIMM_VERSION_DIGITS=$TERADIMM_VERSION_DIGITS"

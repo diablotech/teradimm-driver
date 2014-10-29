@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_configure:
+	touch Makefile.conf
+
+override_dh_auto_build:
+	make -C tools/tdcmd
+	make -C tools/tdctl

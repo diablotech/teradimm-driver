@@ -1,0 +1,17 @@
+# persistent storage links: /dev/disk/{by-id,by-uuid,by-label,by-path}
+# scheme based on "Linux persistent device names", 2004, Hannes Reinecke <hare@suse.de>
+# also based on 60-persistent-storage.rules
+
+ACTION!="add|change", GOTO="persistent_teradimm_end"
+SUBSYSTEM!="block", GOTO="persistent_teradimm_end"
+
+# ignore partitions that span the entire disk
+TEST=="whole_disk", GOTO="persistent_teradimm_end"
+
+# by-id (hardware serial number)
+KERNEL=="td*[!0-9]", IMPORT{program}="ata_id --export $tempnode"
+KERNEL=="td*[!0-9]", ENV{ID_SERIAL}=="?*", SYMLINK+="disk/by-id/mcs-$env{ID_SERIAL}"
+KERNEL=="td*[0-9]", ENV{ID_SERIAL}=="?*", SYMLINK+="disk/by-id/mcs-$env{ID_SERIAL}-part%n"
+
+LABEL="persistent_teradimm_end"
+

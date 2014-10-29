@@ -1,0 +1,11 @@
+Source: teradimm
+Maintainer: Diablo Support <support@diablo-technologies.com>
+Section: misc
+Priority: optional
+Standards-Version: 3.9.4
+Build-Depends: debhelper (>= 9)
+
+Package: teradimm
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: TeraDIMM Kernel module

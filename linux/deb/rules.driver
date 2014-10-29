@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_configure:
+	touch Makefile.conf
+	echo "override teradimm * weak-updates/teradimm" > kmod-teradimm.conf
+
+override_dh_auto_build:
+	make KVERSION= -C linux/driver
