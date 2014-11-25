@@ -93,8 +93,8 @@ struct td_engine {
 	int64_t td_run_state_jiffies;
 	struct completion	td_state_change_completion; /**< used to notify state changes */
 
-	/* For our safe_work API */
-	td_atomic_ptr_t         td_safe_work;
+	/* For our thread_work API */
+	td_atomic_ptr_t         td_thread_work;
 
 	/** counters ready for export via IOCTL */
 	struct td_ioctl_device_stats td_stats;

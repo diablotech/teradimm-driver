@@ -365,7 +365,7 @@ int td_cmdgen_ata (uint64_t bytes[8], uint8_t*ata_cmd, int ssd, int data_size)
 	uint16_t sector_count;
 
 	if ((ata_cmd[0] != 0x85) && (ata_cmd[0] != 0xA1)) {
-		printk("ERROR: Not SAT ATA PT\n");
+		//printk("ERROR: Not SAT ATA PT\n");
 		return -EINVAL;
 	}
 

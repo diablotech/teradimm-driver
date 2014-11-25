@@ -770,7 +770,7 @@ static void td_raid_update_member(struct td_raid *rdev, int member_idx,
 	trm->trm_device = dev;
 	memcpy(trm->trm_uuid, dev->os.uuid, TD_UUID_LENGTH);
 	trm->trm_state = TR_MEMBER_ACTIVE;
-	rdev->tr_member_mask |= (1<<member_idx);
+	rdev->tr_member_mask |= (1ULL<<member_idx);
 
 	trm->ucmd = kmalloc(sizeof(struct td_ucmd), GFP_KERNEL);
 	BUG_ON(trm->ucmd == NULL);

@@ -768,6 +768,8 @@ error_devgroup_stop:
 	td_devgroup_put(dg);
 
 error_not_found:
+	/* poke the devgroup to allow it to react to the new configuration */
+	td_devgroup_poke(dg);
 	return rc;
 }
 

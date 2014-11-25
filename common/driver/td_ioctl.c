@@ -1022,143 +1022,39 @@ ucmd_fail:
 
 int td_ioctl_device_start_bio(struct td_device *dev)
 {
-	int rc, running, to;
-	struct td_engine *eng;
-	struct td_devgroup *dg;
+	int rc;
+	struct td_engine *eng = td_device_engine(dev);
+
 	WARN_TD_DEVICE_UNLOCKED(dev);
-	rc = -ENOENT;
-	eng = td_device_engine(dev);
-	dg = dev->td_devgroup;
-	if (!dg)
-		goto error_no_grp;
 
 	rc = -EIO;
 	if (!eng->bio_context)
 		goto error_no_context;
 
-
-	/* if the devgroup is running, we need to synchronize with */
-	running = td_devgroup_is_running(dg);
-
-	rc = td_devgroup_remove_device(dg, dev);
-	if (rc)
-		goto error_remove_grp;
-
-	if (running)
-		(void) td_devgroup_sync_device(dg, dev);
-
-	td_eng_info(eng, "Restarting BIOs\n");
-	td_engine_start_bio(eng);
-
-	/* Re-attach */
-	rc = td_devgroup_add_device(dg, dev);
-	if (rc)
-		goto error_add_to_grp;
-
-	/* wake up the thread */
-	td_devgroup_poke(dg);
-
-	/* Wait for state: RUNNING */
-	to = td_run_state_wait_ms(eng, RUNNING, 1000);
-	if (to < 0) {
-		rc = -ETIMEDOUT;
-		td_eng_err(eng, "Error: Could not start BIOs; stuck in state %d\n",
-				td_run_state(eng));
-		goto error_init_fail;
-	}
+	td_eng_info(eng, "Resuming BIOs\n");
+	rc = td_engine_start_bio(eng);
 
 
-error_add_to_grp:
-error_remove_grp:
 error_no_context:
-error_no_grp:
-	return rc;
-
-error_init_fail:
-	td_devgroup_remove_device(dg, dev);
-	if (running)
-		(void) td_devgroup_sync_device(dg, dev);
-
-	/* Try to undo device removal.. */
-	if(!td_devgroup_add_device(dg, dev)) {
-		dev->td_devgroup = dg;
-		td_devgroup_poke(dg);
-
-	}
 	return rc;
 }
 
 
 int td_ioctl_device_stop_bio(struct td_device *dev, void *bio_context)
 {
-	int rc, running, to;
-	struct td_engine *eng;
-	struct td_devgroup *dg;
-	WARN_TD_DEVICE_UNLOCKED(dev);
-	rc = -ENOENT;
-	eng = td_device_engine(dev);
-	dg = dev->td_devgroup;
-	if (!dg)
-		goto error_no_grp;
+	int rc;
+	
+	struct td_engine *eng = td_device_engine(dev);
 
 	rc = -EIO;
 	if (!td_run_state_check(eng, RUNNING))
 		goto error_engine_stop;
 
-
-	/* if the devgroup is running, we need to synchronize with */
-	running = td_devgroup_is_running(dg);
-
-	rc = td_devgroup_remove_device(dg, dev);
-	if (rc)
-		goto error_remove_grp;
-
-	if (running)
-		(void) td_devgroup_sync_device(dg, dev);
-
 	td_eng_info(eng, "Stopping BIOs for maitenance operations\n");
-	td_engine_stop_bio(eng, bio_context);
+	rc = td_engine_stop_bio(eng, bio_context);
 
-	/* Re-attach */
-	rc = td_devgroup_add_device(dg, dev);
-	if (rc)
-		goto error_add_to_grp;
 
-	/* wake up the thread */
-	td_devgroup_poke(dg);
-
-	/* Wait for state: UCMD_ONLY */
-	to = td_run_state_wait_ms(eng, UCMD_ONLY, 10000);
-	if (to < 0) {
-		rc = -ETIMEDOUT;
-		td_eng_err(eng, "Error: Could not stop BIOs; stuck in state %d\n",
-				td_run_state(eng));
-		goto error_init_fail;
-	}
-
-	return rc;
-
-error_add_to_grp:
-	td_engine_start_bio(eng);
-
-error_remove_grp:
 error_engine_stop:
-error_no_grp:
-	return rc;
-
-error_init_fail:
-	td_devgroup_remove_device(dg, dev);
-	if (running)
-		(void) td_devgroup_sync_device(dg, dev);
-
-	td_engine_start_bio(eng);
-
-	/* Try to undo device removal.. */
-	if(!td_devgroup_add_device(dg, dev)) {
-		dev->td_devgroup = dg;
-		td_devgroup_poke(dg);
-
-	}
 	return rc;
 }
 
@@ -1166,77 +1062,33 @@ int td_ioctl_device_lock(struct td_device *dev,
 		struct td_ioctl_device_lock *lock,
 		void *locker_context)
 {
-	int rc, running;
-	struct td_engine *eng;
-	struct td_devgroup *dg;
+	int rc;
+	struct td_engine *eng = td_device_engine(dev);
+
 	WARN_TD_DEVICE_UNLOCKED(dev);
-	rc = -ENOENT;
-	eng = td_device_engine(dev);
-	dg = dev->td_devgroup;
-	if (!dg)
+
+	rc = -EINVAL;
+	if (!dev->td_devgroup)
 		goto error_no_grp;
 
 	rc = -EIO;
 	if (!td_run_state_check(eng, RUNNING) &&
 			!td_run_state_check(eng, UCMD_ONLY))
-		goto error_engine_stop;
+		goto error_engine_stopped;
 
-	/* if the devgroup is running, we need to synchronize with */
-	running = td_devgroup_is_running(dg);
-
-	rc = td_devgroup_remove_device(dg, dev);
-	if (rc)
-		goto error_remove_grp;
-
-	/* sync */
-	if (running)
-		(void) td_devgroup_sync_device(dg, dev);
 
 	/* Now we can grab what we want.. */
 	rc = td_engine_lock(eng, lock, locker_context);
-	if (rc)
-		goto error_locking;
-
-	/* Re-attach */
-	rc = td_devgroup_add_device(dg, dev);
-	if (rc)
-		goto error_add_to_grp;
-
-	/* wake up the thread */
-	td_devgroup_poke(dg);
-
-
-error_add_to_grp:
-
-error_remove_grp:
-error_engine_stop:
+error_engine_stopped:
 error_no_grp:
 	return rc;
-
-error_locking:
-	/* Try to undo device removal.. */
-	if(!td_devgroup_add_device(dg, dev)) {
-		dev->td_devgroup = dg;
-		td_devgroup_poke(dg);
-
-	}
-	return rc;
-
-
 }
 
 int td_ioctl_device_unlock(struct td_device *dev,
 		void *locker_context)
 {
-	int rc, running;
-	struct td_engine *eng;
-	struct td_devgroup *dg;
-	WARN_TD_DEVICE_UNLOCKED(dev);
-	rc = -ENOENT;
-	eng = td_device_engine(dev);
-	dg = dev->td_devgroup;
-	if (!dg)
-		goto error_no_grp;
+	int rc;
+	struct td_engine *eng = td_device_engine(dev);
 
 	if (!td_run_state_check(eng, RUNNING) &&
 			!td_run_state_check(eng, UCMD_ONLY)) {
@@ -1244,40 +1096,10 @@ int td_ioctl_device_unlock(struct td_device *dev,
 		goto error_engine_stop;
 	}
 
-	/* if the devgroup is running, we need to synchronize with */
-	running = td_devgroup_is_running(dg);
-
-	rc = td_devgroup_remove_device(dg, dev);
-	if (rc)
-		goto error_remove_grp;
-
-	//dev->td_devgroup = NULL;
-
-	if (running)
-		(void) td_devgroup_sync_device(dg, dev);
-
 	/* Now we can grab what we want.. */
 	rc = td_engine_unlock(eng, locker_context);
 
-	if (rc)
-		printk("ERROR: Unlock failed!");
-	/* Re-attach only if there is a group. */
-	if (dg)
-		rc = td_devgroup_add_device(dg, dev);
-
-	if (rc)
-		goto error_add_to_grp;
-
-	/* success */
-	//dev->td_devgroup = dg;
-
-	/* wake up the thread */
-	td_devgroup_poke(dg);
-
-error_add_to_grp:
-error_remove_grp:
 error_engine_stop:
-error_no_grp:
 	return rc;
 }
 
@@ -1291,6 +1113,38 @@ int td_ioctl_device_go_offline (struct td_device *dev)
 {
 	return td_device_go_offline(dev);
 }
+
+int td_ioctl_device_usermode_exclusive (struct td_device *dev, void* context)
+{
+#ifdef CONFIG_TERADIMM_USERSPACE_API_V1
+	struct task_struct *locker = context;
+
+	WARN_TD_DEVICE_UNLOCKED(dev);
+	
+	/* Only 1 at a time */
+	if ( dev->td_usermode_context != NULL)
+		goto error_no_usermode;
+
+	if (dev->td_devgroup && td_device_detach(dev) ) {
+		td_dev_err(dev, "Could not detach for USERMODE_EXCLUSIVE");
+		goto error_no_usermode;
+	}
+
+	dev->td_usermode_context = context;
+	td_device_enter_state(dev, USERMODE_EXCLUSIVE);
+	td_dev_notice(dev, "USERMODE_EXCLUSIVE given to %s[%u]",
+			locker->comm, locker->pid);
+	return 0;
+
+error_no_usermode:
+	td_dev_warn(dev, "USERMODE_EXCLUSIVE could not be granted to %s[%u]",
+			locker->comm, locker->pid);
+	return -EBUSY;
+#else
+	return -EACCES;
+#endif
+}
+
 int td_ioctl_device_attach (struct td_device *dev,
 		const char *devgroup)
 {

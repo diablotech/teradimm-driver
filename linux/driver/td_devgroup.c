@@ -47,12 +47,12 @@ static int check_token_recompute(struct td_devgroup *dg, uint32_t u1, uint64_t u
 const struct td_dg_conf_var_desc td_dg_conf_general_var_desc[TD_DEVGROUP_CONF_GENERAL_MAX] = {
 #ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
 	TD_DG_CONF_GENERAL_ENTRY(ENDIO_ENABLE,                            always,   0, UINT_MAX)
-	TD_DG_CONF_GENERAL_ENTRY(ENDIO_SPIN_MSEC,                         always,   1, UINT_MAX)
+	TD_DG_CONF_GENERAL_ENTRY(ENDIO_SPIN_MSEC,                         always,   0, UINT_MAX)
 #endif
 };
 
 const struct td_dg_conf_var_desc td_dg_conf_worker_var_desc[TD_DEVGROUP_CONF_WORKER_MAX] = {
-	TD_DG_CONF_WORKER_ENTRY(MAX_OCCUPANCY,                 token_recompute,  0, UINT_MAX)
+	TD_DG_CONF_WORKER_ENTRY(MAX_OCCUPANCY,                 token_recompute,  1, UINT_MAX)
 	TD_DG_CONF_WORKER_ENTRY(EXTRA_TOKENS,                  token_recompute,  0, UINT_MAX)
 	TD_DG_CONF_WORKER_ENTRY(MAX_LOOPS,                              always,  0, UINT_MAX)
 	TD_DG_CONF_WORKER_ENTRY(WITHOUT_DEVS_NSEC,                      always,  0, UINT_MAX)
@@ -187,13 +187,17 @@ static struct td_devgroup *__td_devgroup_create(const char *name, int socket,
 
 	strncpy(dg->dg_name, name, TD_DEVGROUP_NAME_MAX);
 
+#ifndef TERADIMM_CONFIG_AVOID_EVENTS
 	init_waitqueue_head(&dg->dg_event);
+#endif
 
 	INIT_LIST_HEAD(&dg->dg_devs_list);
 	spin_lock_init(&dg->dg_devs_lock);
 
 #ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
+#ifndef TERADIMM_CONFIG_AVOID_EVENTS
 	init_waitqueue_head(&dg->dg_endio_event);
+#endif
 	spin_lock_init(&dg->dg_endio_lock);
 	bio_list_init(&dg->dg_endio_success);
 	bio_list_init(&dg->dg_endio_failure);
@@ -852,9 +856,13 @@ void td_devgroup_queue_endio(struct td_devgroup *dg, td_bio_ref bio, int result)
 		bio_list_add(&dg->dg_endio_failure, bio);
 
 	dg->dg_endio_count ++;
-	dg->dg_endio_ts = jiffies;
+	if (dg->dg_endio_ts == 0)
+		dg->dg_endio_ts = jiffies;
 
 	spin_unlock_bh(&dg->dg_endio_lock);
+#ifndef TERADIMM_CONFIG_AVOID_EVENTS
+	wake_up_interruptible(&dg->dg_endio_event);
+#endif
 	td_dg_counter_var_endio_inc(dg, QUEUED);
 }
 
@@ -875,7 +883,10 @@ unsigned __td_devgroup_do_endio (struct td_devgroup* dg)
 	/* Grab the lock */
 	spin_lock_bh(&dg->dg_endio_lock);
 
-	ts_delta -= dg->dg_endio_ts;
+	if (ts_delta > dg->dg_endio_ts)
+		ts_delta -= dg->dg_endio_ts;
+	else
+		ts_delta = 1;
 
 	/* Stash good ones */
 	bio_list_merge(&good, &dg->dg_endio_success);
@@ -892,8 +903,8 @@ unsigned __td_devgroup_do_endio (struct td_devgroup* dg)
 	spin_unlock_bh(&dg->dg_endio_lock);
 
 	if (ts_delta > 3) {
-		pr_warn("DG %s endio lost %lu jiffies\n", dg->dg_name,
-				ts_delta);
+		pr_warn("DG %s endio lost %lu jiffies (%lu)\n", dg->dg_name,
+				ts_delta, jiffies);
 	}
 	
 	/* Now we complete things, good first */
@@ -939,11 +950,11 @@ static int td_devgroup_endio(void *thread_data)
 				td_dg_counter_var_endio_add(dg, STOLEN, count);
 				/* Make sure the completion worldlet gets to run */
 				dg->dg_endio_last_activity = jiffies;
-				schedule();
 			}
 		}
+		schedule();
 
-		/* Maybe something happend while we were completing IO */
+		/* Maybe something happened while we were completing IO */
 		if (! dg->dg_endio_count) {
 			unsigned idle_timeout = 1 + msecs_to_jiffies(td_dg_conf_general_var_get(dg, ENDIO_SPIN_MSEC));
 			if (time_after(jiffies, dg->dg_endio_last_activity + idle_timeout)) {

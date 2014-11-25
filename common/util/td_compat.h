@@ -190,6 +190,31 @@ static inline void clflush(volatile void *__p)
 }
 #endif /* KABI__clflush */
 
+
+#ifndef KABI__strim
+/**
+ * Used by functinos to trim space of strings before comparing
+ */
+static inline char *strim(char *s)
+{
+	size_t size;
+	char *end;
+
+	size = strlen(s);
+	if (!size)
+		return s;
+
+	end = s + size - 1;
+	while (end >= s && isspace(*end))
+		end--;
+	*(end + 1) = '\0';
+
+	while (isspace(*s))
+		++s;
+	return s;
+}
+#endif
+
 #ifndef KABI__clflush_cache_range
 /**
  * clflush_cache_range - flush a cache range with clflush

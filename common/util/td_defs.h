@@ -501,6 +501,8 @@ enum td_device_state_type {
 
 	TD_DEVICE_STATE_RAID_MEMBER, /*!< TD_NORMAL_DEVICE is part of a raid set */
 
+	TD_DEVICE_STATE_USERMODE_EXCLUSIVE,
+
 	TD_DEVICE_STATE_TYPE_MAX
 };
 

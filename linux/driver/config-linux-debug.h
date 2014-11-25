@@ -84,6 +84,9 @@
 
 #define CONFIG_TERADIMM_DEPREICATED_RAID_CREATE_V0
 
+/* Get this out so people can play with USERSPACE driver */
+#define CONFIG_TERADIMM_USERSPACE_API_V1
+
 /* valid settings for MAP are TD_MAP_TYPE_{UC,WC,WB} see td_mapper.h */
 #ifdef KABI__ioremap_wc
 #define CONFIG_TERADIMM_MAP_STATUS          TD_MAP_TYPE_WC

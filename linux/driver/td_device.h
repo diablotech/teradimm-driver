@@ -61,6 +61,10 @@ struct td_device {
 	int                 td_irq;
 	uint16_t            td_memspeed;
 	uint16_t            td_cpu_socket;
+
+#ifdef CONFIG_TERADIMM_USERSPACE_API_V1
+	struct task_struct  *td_usermode_context;
+#endif
 	
 };
 

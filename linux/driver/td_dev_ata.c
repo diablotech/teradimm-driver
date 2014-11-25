@@ -1341,7 +1341,7 @@ int td_device_block_sgio(struct td_engine *eng, sg_io_hdr_t *hdr)
 		rc = td_dev_sgio_v3(eng, hdr);
 		break;
 	case 'Q': /* V4 not supported yet. */
-		td_eng_err(eng, "TSA: SG_IO V4 not supported!\n");
+		//td_eng_err(eng, "TSA: SG_IO V4 not supported!\n");
 		rc = -EINVAL;
 		break;
 	default:

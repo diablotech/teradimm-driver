@@ -361,7 +361,8 @@ enum td_cmd_e {
 	TD_CMD_HWF_DATAECC	= 0xFB,
 	TD_CMD_HWF_TIMEOUT	= 0xFC,
 	TD_CMD_HWF_XSUM 	= 0xFD,
-	/* 0xFE reserved */
+	TD_CMD_HWF_CMDECC       = 0xFE,
+
 	TD_CMD_DEALLOC_BUF	= 0xFF
 };
 

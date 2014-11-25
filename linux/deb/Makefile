@@ -1,14 +1,13 @@
 TOP=../..
 
--include ${TOP}/Makefile.conf
-
-
 # Paths from GIT to include in our source tar
-PATH_LIST          := linux common tools Makefile Makefile.ver TD-VERSION-GEN
+PATH_LIST          := linux common tools Makefile.ver TD-VERSION-GEN
 
 DEBBUILD_TREE      := $(shell pwd)/debbuild
 DEBBUILD_ARCH      := $(shell uname -m)
+ifndef DEBBUILD_KVER
 DEBBUILD_KVER      := $(shell uname -r)
+endif
 MKDIR_P             = mkdir -p
 OUTDIRS             = SOURCES
 TAR = tar --transform "s,^,teradimm_$(TERADIMM_VERSION)/,"
@@ -57,7 +56,10 @@ $(DEBBUILD_TREE)/SOURCES/%.gz: %
 
 src.deb: debbuild-tree $(DEBBUILD_TREE)/SOURCES/teradimm_$(TERADIMM_VERSION).tar.gz
 	cp $(DEBBUILD_TREE)/SOURCES/teradimm_$(TERADIMM_VERSION).tar.gz teradimm_$(TERADIMM_VERSION).orig.tar.gz
-	tar -xzf $(DEBBUILD_TREE)/SOURCES/teradimm_$(TERADIMM_VERSION).tar.gz
+
+driver.deb: src.deb teradimm_$(TERADIMM_VERSION).orig.tar.gz
+	rm -rf teradimm_$(TERADIMM_VERSION)
+	tar -xzf teradimm_$(TERADIMM_VERSION).orig.tar.gz
 	mkdir -p debian/source
 	dch --create -v $(TERADIMM_VERSION) --package teradimm "new version"
 	echo 9 > debian/compat
@@ -76,8 +78,9 @@ src.deb: debbuild-tree $(DEBBUILD_TREE)/SOURCES/teradimm_$(TERADIMM_VERSION).tar
 	mv debian teradimm_$(TERADIMM_VERSION)
 	cd teradimm_$(TERADIMM_VERSION);debuild -uc -us
 
+tools.deb: src.deb teradimm_$(TERADIMM_VERSION).orig.tar.gz
 	rm -rf teradimm_$(TERADIMM_VERSION)
-	tar -xzf $(DEBBUILD_TREE)/SOURCES/teradimm_$(TERADIMM_VERSION).tar.gz
+	tar -xzf teradimm_$(TERADIMM_VERSION).orig.tar.gz
 	mkdir -p debian/source
 	dch --create -v $(TERADIMM_VERSION) --package teradimm "new version"
 	echo 9 > debian/compat
@@ -91,7 +94,7 @@ src.deb: debbuild-tree $(DEBBUILD_TREE)/SOURCES/teradimm_$(TERADIMM_VERSION).tar
 	cd teradimm_$(TERADIMM_VERSION);debuild -uc -us
 
 clean:
-	rm -rf filelist *.tar *.tz debbuild teradimm* VERSION
+	rm -rf filelist *.tar *.gz debbuild teradimm* VERSION
 
 .PHONY: FORCE
 	

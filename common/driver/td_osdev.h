@@ -149,7 +149,7 @@ int td_osdev_init (struct td_osdev* dev, enum td_osdev_type,
 
 extern int td_osdev_register (struct td_osdev* dev);
 extern int td_osdev_online (struct td_osdev* dev);
-extern void td_osdev_offline (struct td_osdev* dev);
+extern int td_osdev_offline (struct td_osdev* dev);
 extern void td_osdev_unregister (struct td_osdev* dev);
 
 extern void td_osdev_error_bio (td_bio_ref);

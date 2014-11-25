@@ -536,6 +536,8 @@ struct __packed td_ioctl_raid_state {
 /** ioctl used to attach a device to a device group */
 #define TD_IOCTL_DEVICE_ATTACH  _IOW(TERADIMM_IOC, 20, struct td_ioctl_devgroup_name)
 
+#define TD_IOCTL_DEVICE_USERMODE_EXCLUSIVE  _IO(TERADIMM_IOC, 20)
+
 /** ioctl used to detach a device from a device group */
 #define TD_IOCTL_DEVICE_DETACH  _IO(TERADIMM_IOC, 21)
 
@@ -714,6 +716,7 @@ int td_device_is_locked(struct td_device *dev,
 int td_ioctl_device_go_online (struct td_device *dev);
 int td_ioctl_device_go_offline (struct td_device *dev);
 
+int td_ioctl_device_usermode_exclusive (struct td_device *dev, void* context);
 int td_ioctl_device_attach (struct td_device *dev,
 		const char* devgroup);
 int td_ioctl_device_detach (struct td_device *dev);

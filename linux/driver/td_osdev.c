@@ -48,6 +48,10 @@
 #include <linux/delay.h>
 
 
+#ifdef CONFIG_TERADIMM_USERSPACE_API_V1
+static char* td_mmap_prot = "wc";
+module_param_named(mmap_prot, td_mmap_prot, charp, 0644);
+#endif
 
 /* declartions - These are our API to linux/driver/td_block.c */
 int td_linux_block_create(struct td_osdev *dev);
@@ -401,6 +405,15 @@ static int td_device_char_release(struct inode *inode, struct file *filp)
 #endif
 			td_engine_start_bio(eng);
 		}
+		
+#ifdef CONFIG_TERADIMM_USERSPACE_API_V1
+		if (td_dev->td_usermode_context && current->tgid == td_dev->td_usermode_context->tgid) {
+			td_os_warn(dev, "pid %u [%s] releasing device with USERMODE_EXCLUSIVE\n",
+					current->tgid, current->comm);
+			td_device_enter_state(td_dev, OFFLINE);
+			td_dev->td_usermode_context = NULL;
+		}
+#endif
 	}
 	atomic_dec(&dev->control_users);
 
@@ -425,12 +438,92 @@ static ssize_t td_device_char_write(struct file *filp, const char __user *buf,
 	return -EIO;
 }
 
+#ifdef CONFIG_TERADIMM_USERSPACE_API_V1
 static int td_device_char_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	/*struct td_device *dev = filp->private_data; */
+	struct td_osdev *osdev = filp->private_data;
+	struct td_device *dev;
+	
+	unsigned long req_offset, req_size;
+	unsigned long phys_base, phys_size;
+	unsigned long pfn;
+	char *dup, *mp;
+	
+	if (osdev->type != TD_OSDEV_DEVICE) {
+		td_os_err(osdev, "Attempt to mmap; not supported\n");
+		return -EIO;
+	}
+	dev = td_device_from_os(osdev);
 
+	if (! td_device_check_state(dev, USERMODE_EXCLUSIVE)) {
+		td_os_err(osdev, "cannot mmap a device that's not exlusive\n");
+		return -EBUSY;
+	}
+
+	dup = kstrndup(td_mmap_prot, 16, GFP_KERNEL);
+	if (!dup)
+		return -ENOMEM;
+
+	mp = strim(dup);
+
+	if (!strcmp(mp, "wb")) {
+		/* default is WB */
+
+	} else if (!strcmp(mp, "wc")) {
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+
+	} else if (!strcmp(mp, "uc")) {
+		pgprotval_t val = pgprot_val(vma->vm_page_prot);
+		val &= ~_PAGE_CACHE_MASK;
+		val |= _PAGE_CACHE_UC;
+		vma->vm_page_prot = __pgprot(val);
+
+	} else if (!strcmp(mp, "uc-")) {
+		pgprotval_t val = pgprot_val(vma->vm_page_prot);
+		val &= ~_PAGE_CACHE_MASK;
+		val |= _PAGE_CACHE_UC_MINUS;
+		vma->vm_page_prot = __pgprot(val);
+	} else {
+		td_os_err(osdev, "mmap_prot module parameter value '%s' is invalid\n", mp);
+
+		kfree(dup);
+		return -EINVAL;
+	}
+
+	kfree(dup);
+	mp = dup = NULL;
+
+	/* this is the actual device size */
+	phys_base = dev->td_mapper.phys_base;
+	phys_size = dev->td_mapper.phys_size;
+
+	/* this is what the user wants to map */
+	req_size   = vma->vm_end - vma->vm_start;
+	req_offset = vma->vm_pgoff << PAGE_SHIFT;
+
+	if (req_offset > phys_size
+			|| (req_size+req_offset) > phys_size
+			|| req_size & ~PAGE_MASK)
+		return -EINVAL;
+
+	/* PFN of the first page */
+	pfn = phys_base >> PAGE_SHIFT;
+
+	/* PFN of user requested page */
+	pfn += vma->vm_pgoff;
+
+	if (io_remap_pfn_range(vma, vma->vm_start, pfn,
+				req_size, vma->vm_page_prot))
+		return -EAGAIN;
+
+	return 0;
+}
+#else
+static int td_device_char_mmap(struct file *filp, struct vm_area_struct *vma)
+{
 	return -EIO;
 }
+#endif
 
 static loff_t td_device_char_llseek(struct file *filp, loff_t off, int seek)
 {
@@ -624,11 +717,12 @@ error_block_create:
 	return rc;
 }
 
-void td_osdev_offline (struct td_osdev *dev)
+int td_osdev_offline (struct td_osdev *dev)
 {
 	td_linux_block_unregister(dev);
 	td_linux_block_destroy(dev);
 	dev->block_params.capacity = 0;
+	return 0;
 }
 
 void td_osdev_unregister (struct td_osdev *dev)

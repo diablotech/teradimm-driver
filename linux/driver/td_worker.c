@@ -608,35 +608,40 @@ static int td_worker_thread(void *thread_data)
 						+ td_all_active_tokens(eng)
 						+ td_early_completed_reads(eng);
 
+					if (dev_activity < 0) {
+						/* this device can no longer participate */
+						wi_trace(wi, TR_SCOUT, "WORKER-ERROR", (uint64_t)rc);
+						td_worker_release_an_active_device(w, wi);
+						break;
+					}
+
+					if (!dev_activity && !dev_future_work) {
+						/* this device has no work, and if that
+						 * happens for too long get rid of it */
+						long diff = jiffies - wi->wi_last_activity;
+						if (diff > td_dg_conf_worker_var_get(dg, DEV_IDLE_JIFFIES)) {
+							wi_trace(wi, TR_SCOUT, "WORKER-IDLE", w->w_loops);
+							td_worker_release_an_active_device(w, wi);
+							break;
+						}
+					}
+
+					total_activity += dev_activity;
+					total_future_work += dev_future_work;
+
+					if ((dev_activity > 0) || total_future_work)
+						wi->wi_last_activity = jiffies;
+				} else {
+					wi_trace(wi, TR_SCOUT, "WORKER-SYNC", w->w_loops);
+					td_worker_release_an_active_device(w, wi);
+					break;
 				}
 
 				/* work on this device is done, signal to
 				 * other threads, if needed */
 				td_work_item_sync_event(wi);
 
-				if (dev_activity < 0) {
-					/* this device can no longer participate */
-					wi_trace(wi, TR_SCOUT, "WORKER-ERROR", (uint64_t)rc);
-					td_worker_release_an_active_device(w, wi);
-					break;
-				}
 
-				if (!dev_activity && !dev_future_work) {
-					/* this device has no work, and if that
-					 * happens for too long get rid of it */
-					long diff = jiffies - wi->wi_last_activity;
-					if (diff > td_dg_conf_worker_var_get(dg, DEV_IDLE_JIFFIES)) {
-						wi_trace(wi, TR_SCOUT, "WORKER-IDLE", w->w_loops);
-						td_worker_release_an_active_device(w, wi);
-						break;
-					}
-				}
-
-				total_activity += dev_activity;
-				total_future_work += dev_future_work;
-
-				if ((dev_activity > 0) || total_future_work)
-					wi->wi_last_activity = jiffies;
 				mb();
 			}
 
@@ -736,13 +741,24 @@ static int td_work_item_sync_condition(struct td_work_node *wn,
 {
 	struct td_devgroup *dg;
 
-	if (wi->wi_loops != start)
-		return 1;
-
-	if (!td_work_item_can_run(wi)
-			&& !wi->wi_scout_worker
-			&& !wi->wi_active_worker)
-		return 1;
+	/* 
+	 * The sync condition is different if we are runnable or not:
+	 * 1) If runnable, we're waiting for something to start
+	 *    - once we see wi_loops incrementing, it is running
+	 * 2) If not runnable, we are waiting for it to be idle
+	 *    - We look for scout and active workers to be NULL
+	 * Otherwise, we set the sync_req, and poke the groups
+	 * event to make sure they are running and service this
+	 * work item.
+	 */
+	if (td_work_item_can_run(wi) )
+	{
+		if (wi->wi_loops != start)
+			return 1;
+	} else {
+		if (!wi->wi_scout_worker && !wi->wi_active_worker)
+			return 1;
+	}
 
 	/* set the request */
 	atomic_set(&wi->wi_sync_req, 1);
@@ -756,10 +772,9 @@ static int td_work_item_sync_condition(struct td_work_node *wn,
 	return 0;
 }
 
-/** wait for upto a second for one of the following conditions:
- * - thread completed one pass through the loop
- * - thread is no longer running
- * - 1 second has elapsed
+/** wait for a work item to be synchronized, waiting for one of:
+ * - work item sync_condition is met:
+ * - SYNC_JIFFIES jiffies has elapsed
  */
 int td_work_node_synchronize_item(struct td_work_node *wn, struct td_work_item *wi)
 {
@@ -777,7 +792,7 @@ int td_work_node_synchronize_item(struct td_work_node *wn, struct td_work_item *
 	/* wait for it to synchronize with us */
 #ifdef TERADIMM_CONFIG_AVOID_EVENTS
 	rc = td_dg_conf_worker_var_get(dg, SYNC_JIFFIES);
-	while (!td_work_item_sync_condition(wn, wi, start) && rc < 1) {
+	while (!td_work_item_sync_condition(wn, wi, start) && rc > 0) {
 		int to_sleep = min(10, rc);
 		schedule_timeout(to_sleep);
 		rc -= to_sleep;
@@ -874,15 +889,9 @@ int td_work_node_init(struct td_work_node *wn, struct td_devgroup *dg)
 			continue;
 #endif
 
-		WARN_ON(worker >= cpus_per_socket);
 		if(worker >= cpus_per_socket)
 			break;
 
-#if 0
-		/* Do not get HT siblings */
-		if (cpu % 2 == 0)
-			continue;
-#endif
 		td_worker_init(wn->wn_workers + worker,
 				cpu, wn);
 		worker++;

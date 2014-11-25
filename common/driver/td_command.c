@@ -351,6 +351,13 @@ static int __td_cmd_fcode_handling (struct td_engine *eng,
 		tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 		break;
 
+	case TD_CMD_HWF_CMDECC:
+		td_eng_err(eng, "  HW CMD ECC %016llx\n", xs);
+		eng->td_counters.token.cmd_ecc_error_cnt ++;
+		tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
+		break;
+
+
 	case TD_CMD_HWF_HWCMD:
 	default:
 		eng->td_counters.token.cmd_error_cnt ++;

@@ -76,7 +76,9 @@ struct td_devgroup {
 
 	struct td_work_node dg_work_node;
 
+#ifndef TERADIMM_CONFIG_AVOID_EVENTS
 	wait_queue_head_t   dg_event;       /**< events that the worker thread waits on */
+#endif
 
 #ifdef CONFIG_TERADIMM_TRACK_CPU_USAGE
 	struct td_cpu_stats dg_cpu_stats;   /**< statistics on where time is spent */
@@ -87,7 +89,9 @@ struct td_devgroup {
 	
 #ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
 	struct task_struct  *dg_endio_task;
+#ifndef TERADIMM_CONFIG_AVOID_EVENTS
 	wait_queue_head_t   dg_endio_event;       /**< events that the worker thread waits on */
+#endif
 	unsigned long       dg_endio_last_activity;
 
 	spinlock_t          dg_endio_lock;
@@ -183,7 +187,9 @@ static inline void td_devgroup_poke(struct td_devgroup *dg)
 		after = atomic_sub_return(1, &dg->dg_work_node.wn_worker_tokens_idle);
 		if (after >= 0) {
 			atomic_inc(&dg->dg_work_node.wn_worker_tokens);
+#ifndef TERADIMM_CONFIG_AVOID_EVENTS
 			wake_up_interruptible(&dg->dg_event);
+#endif
 		}
 		else
 			atomic_inc(&dg->dg_work_node.wn_worker_tokens_idle);

@@ -89,9 +89,10 @@ static void td_update_sampled_rate(struct td_engine *eng);
 static int td_engine_deallocate_rdbuf(struct td_engine *eng, unsigned rdbuf);
 
 /*
- * td_eng_run_safe_work
- *  Insert work into our "safe_work".  This is *not* running from DG context,
- *  that has already been checked by the td_eng_safe_work() entry API.
+ * td_eng_run_thread_work
+ *  Insert work into our "thread_work".  This is *not* running from DG context,
+ *  that has already been checked by the td_eng_thread_work/td_eng_safe_work()
+ *  entry API.
  *  Here, we exchange the atomic64, and make sure to replace it afterwards
  *  if necessary.
  *  Since we're not in the DG, we're here through an IOCTL that must have the
@@ -99,7 +100,7 @@ static int td_engine_deallocate_rdbuf(struct td_engine *eng, unsigned rdbuf);
  *  it will not go away.  Since we (eng) are in it, it can't be stopped, so we
  *  can rely on the fact that it will run our function
  */
-int __td_eng_run_safe_work (struct td_engine *eng, struct td_eng_thread_work *work)
+int __td_eng_run_thread_work (struct td_engine *eng, struct td_eng_thread_work *work)
 {
 	int rc;
 	void* prev_work;
@@ -118,19 +119,19 @@ int __td_eng_run_safe_work (struct td_engine *eng, struct td_eng_thread_work *wo
 		goto error;
 	}
 
-	if (work->verbose) td_eng_debug(eng, "Submitting work \"%s\"\n", work->name);
+	if (work->verbose) td_eng_info(eng, "Submitting work \"%s\"\n", work->name);
 	init_completion(&work->work_done);
 	
-	prev_work = td_atomic_ptr_xchg(&eng->td_safe_work, work);
+	prev_work = td_atomic_ptr_xchg(&eng->td_thread_work, work);
 	td_engine_sometimes_poke(eng);
 
 	wait_for_completion( &work->work_done);
 
-	if (work->verbose) td_eng_debug(eng, "work result = %d (%d)\n", work->result, rc);
+	if (work->verbose) td_eng_info(eng, "work result = %d (%d)\n", work->result, rc);
 	rc = work->result;
 
 	while (prev_work) {
-		prev_work = td_atomic_ptr_xchg(&eng->td_safe_work, prev_work);
+		prev_work = td_atomic_ptr_xchg(&eng->td_thread_work, prev_work);
 		if (prev_work) {
 			struct td_eng_thread_work* work = prev_work;
 			td_eng_warn(eng, "work swap storm noticed: '%s'....\n", work->name );
@@ -244,7 +245,7 @@ static int td_test_waiting_incoming_capacity(struct td_engine *eng)
 int td_test_waiting_incoming_capacity(struct td_engine *eng)
 {
 
-	int rc;
+	int rc, got_it;
 	uint64_t sleep_thrsh;
 	unsigned active;
 
@@ -260,8 +261,10 @@ int td_test_waiting_incoming_capacity(struct td_engine *eng)
 
 		/* try to become active */
 		active = atomic_inc_return(&eng->td_total_system_bios);
-		if (likely (active <= sleep_thrsh))
+		if (likely (active <= sleep_thrsh)) {
+			got_it = 1;
 			return 1;
+		}
 
 		/* again failed to become active */
 		atomic_dec(&eng->td_total_system_bios);
@@ -283,6 +286,7 @@ int td_test_waiting_incoming_capacity(struct td_engine *eng)
 
 	/* this task will now wait until things get below the wake threshold
 	 * and be woken up by td_eng_account_bio_completion() */
+	got_it = 0;
 	atomic_inc(&eng->td_total_incoming_waiters);
 	rc = wait_event_interruptible(eng->td_incoming_sleep,
 			__positive_event_condition(eng));
@@ -293,6 +297,14 @@ int td_test_waiting_incoming_capacity(struct td_engine *eng)
 	if (rc == -ERESTARTSYS)
 		return -EAGAIN;
 #endif
+
+	/*
+	 * If we were interrupted, we couldn't wait, but this BIO is going
+	 * in anyways, we need it accounted for (since it will be accounted
+	 * for on the way out)
+	 */
+	if (!got_it)
+		active = atomic_inc_return(&eng->td_total_system_bios);
 
 	/* the device might have gone DEAD while we waited */
 	if (unlikely(!td_state_can_accept_requests(eng)))
@@ -893,15 +905,15 @@ int td_engine_io_sanity_check(struct td_engine *eng)
 #endif
 
 	/* Quickly sneak in any safe work */
-	if (unlikely(td_atomic_ptr_read(&eng->td_safe_work))) {
-		struct td_eng_thread_work *safe_work = td_atomic_ptr_xchg(&eng->td_safe_work, 0);
-		if (safe_work) {
-			td_eng_trace(eng, TR_ENGWORK, "safe_work:ptr", (uint64_t)safe_work);
-			td_eng_trace(eng, TR_ENGWORK, "safe_work:func", (uint64_t)safe_work->func);
-			if (safe_work->verbose)
-				td_eng_debug(eng, "Running \"%s\" safe_work\n", safe_work->name);
-			safe_work->result = safe_work->func(eng, safe_work);
-			complete_all(&safe_work->work_done);
+	if (unlikely(td_atomic_ptr_read(&eng->td_thread_work))) {
+		struct td_eng_thread_work *work = td_atomic_ptr_xchg(&eng->td_thread_work, 0);
+		if (work) {
+			td_eng_trace(eng, TR_ENGWORK, "thread_work:ptr", (uint64_t)work);
+			td_eng_trace(eng, TR_ENGWORK, "thread_work:func", (uint64_t)work->func);
+			if (work->verbose)
+				td_eng_debug(eng, "Running \"%s\" thread_work\n", work->name);
+			work->result = work->func(eng, work);
+			complete_all(&work->work_done);
 		}
 	}
 
@@ -971,7 +983,7 @@ int td_engine_needs_cpu_time(struct td_engine *eng)
 		return td_engine_queued_work(eng)
 			|| td_all_active_tokens(eng)
 			|| td_early_completed_reads(eng)
-			|| (td_engine_has_dg_work(eng));
+			|| (td_engine_has_thread_work(eng));
 	}
 
 	if (td_run_state_check(eng, PM_DRAIN) ||
@@ -990,7 +1002,7 @@ int td_engine_needs_cpu_time(struct td_engine *eng)
 		return 1;
 	}
 
-	if (td_engine_has_dg_work(eng))
+	if (td_engine_has_thread_work(eng))
 		return 1;
 
 	return 0;
@@ -3233,10 +3245,32 @@ int td_eng_send_next_throttled_rdbuf_deallocate(struct td_engine *eng)
 }
 #endif
 
-int td_engine_start_bio(struct td_engine *eng)
-{
-	int rc = -EINVAL;
+struct td_eng_bio_change_work_state {
+	struct td_eng_thread_work work;
+	void *bio_context;
+};
 
+static int __td_engine_bio_stop (struct td_engine *eng, void* data)
+{
+	struct td_eng_bio_change_work_state *state =
+		container_of(data, struct td_eng_bio_change_work_state, work);
+
+	eng->td_prev_state = eng->td_run_state;
+	td_run_state_enter(eng, BIO_DRAIN);
+	eng->bio_context = state->bio_context;
+
+	return 0;
+}
+
+static int __td_engine_bio_start (struct td_engine *eng, void* data)
+{
+	int rc;
+#if 0
+	struct td_eng_bio_change_work_state *state =
+		container_of(data, struct td_eng_bio_change_work_state, work);
+#endif
+
+	rc = -EINVAL;
 	if(!eng->bio_context)
 		goto not_locked;
 
@@ -3244,7 +3278,6 @@ int td_engine_start_bio(struct td_engine *eng)
 			td_run_state_check(eng, UCMD_ONLY) )
 		__td_run_state_enter(eng, __FUNCTION__, __FILENAME__, __LINE__, eng->td_prev_state);
 
-	init_completion(&eng->td_state_change_completion);
 	eng->bio_context = NULL;
 	rc = 0;
 
@@ -3254,39 +3287,64 @@ not_locked:
 
 int td_engine_stop_bio(struct td_engine *eng, void *bio_context)
 {
+	struct td_eng_bio_change_work_state thread_work = {
+		.work.name = "bio_stop",
+		.work.func = __td_engine_bio_stop,
+		.bio_context = bio_context,
+	};
 	int rc = 0;
-	WARN_ON(td_device_group(td_engine_device(eng)));
-	eng->td_prev_state = eng->td_run_state;
-	td_run_state_enter(eng, BIO_DRAIN);
-	init_completion(&eng->td_state_change_completion);
-	eng->bio_context = bio_context;
+
+	rc = td_eng_thread_work(eng, &thread_work.work);
+	if (rc == 0)
+		rc = thread_work.work.result;
 
 	return rc;
 }
 
-int td_engine_lock(struct td_engine *eng, struct td_ioctl_device_lock *lock, void *locker_context)
+int td_engine_start_bio(struct td_engine *eng)
 {
+	struct td_eng_bio_change_work_state thread_work = {
+		.work.name = "bio_start",
+		.work.func = __td_engine_bio_start,
+		.bio_context = NULL,
+	};
+	int rc = 0;
+
+	rc = td_eng_thread_work(eng, &thread_work.work);
+	if (rc == 0)
+		rc = thread_work.work.result;
+
+	return rc;
+}
+
+struct td_eng_lock_work_state {
+	struct td_eng_thread_work work;
+	struct td_ioctl_device_lock *lock;
+	void * locker_context;
+};
+
+static int __td_engine_lock(struct td_engine *eng, void* data)
+{
+
+	struct td_eng_lock_work_state *state =
+		container_of(data, struct td_eng_lock_work_state, work);
 	uint16_t rc;
 	int ret = -EBUSY;
 	
 	if (eng->locker_context)
 		goto already_locked;
 	
-	/* We are groveling through stuff that can't happen if the device
-	 * group is running */
-	WARN_ON(td_device_group(td_engine_device(eng)));
-
 	ret = -EIO;
 	rc = td_alloc_core_buffer_range(eng,
-			lock->core_start, lock->core_size);
+			state->lock->core_start, state->lock->core_size);
 
 	if (TD_INVALID_CORE_BUFID == rc) {
 		goto core_alloc_failed;
 	}
 
-	eng->locker_context = locker_context;
-	eng->td_core_lock_start = lock->core_start;
-	eng->td_core_lock_size = lock->core_size;
+	eng->locker_context = state->locker_context;
+	eng->td_core_lock_start = state->lock->core_start;
+	eng->td_core_lock_size = state->lock->core_size;
 	
 	td_eng_notice(eng, "Locked buffers %u to %u\n", eng->td_core_lock_start,
 				eng->td_core_lock_start + eng->td_core_lock_size -1);
@@ -3300,15 +3358,17 @@ already_locked:
 
 }
 
-int td_engine_unlock(struct td_engine *eng, void *locker_context)
+static int __td_engine_unlock(struct td_engine *eng, void* data)
 {
+	struct td_eng_lock_work_state *state =
+		container_of(data, struct td_eng_lock_work_state, work);
 	uint16_t start, end;
 	int ret = -EINVAL;
 
 	if (!eng->locker_context)
 		goto not_locked;
 
-	if (locker_context != eng->locker_context)
+	if (state->locker_context != eng->locker_context)
 		goto inval_task;
 
 	start = eng->td_core_lock_start;
@@ -3326,6 +3386,39 @@ inval_task:
 not_locked:
 	return ret;
 }
+
+int td_engine_lock(struct td_engine *eng, struct td_ioctl_device_lock *lock, void *locker_context)
+{
+	struct td_eng_lock_work_state thread_work = {
+		.work.name = "lock",
+		.work.func = __td_engine_lock,
+		.lock = lock,
+		.locker_context = locker_context,
+	};
+	int rc = 0;
+
+	rc = td_eng_thread_work(eng, &thread_work.work);
+	if (rc == 0)
+		rc = thread_work.work.result;
+
+	return rc;
+}
+
+int td_engine_unlock(struct td_engine *eng, void *locker_context)
+{
+	struct td_eng_lock_work_state thread_work = {
+		.work.name = "ulock",
+		.work.func = __td_engine_unlock,
+		.locker_context = locker_context,
+	};
+	int rc = 0;
+
+	rc = td_eng_thread_work(eng, &thread_work.work);
+	if (rc == 0)
+		rc = thread_work.work.result;
+
+	return rc;
+};
 
 int td_engine_recover_read_buffer_orphans(struct td_engine *eng)
 {
@@ -3532,8 +3625,8 @@ int td_engine_init(struct td_engine *eng, struct td_device *dev)
 	td_histogram_init(&eng->hist_post_comp_queued,
 			         "%s:post_comp_queued",  name);
 
-	/* ATOMIC set our td_safe_work */
-	td_atomic_ptr_set(&eng->td_safe_work, 0);
+	/* ATOMIC set our td_thread_work */
+	td_atomic_ptr_set(&eng->td_thread_work, 0);
 
 	/* initially the copy ops do nothing */
 	eng->td_bio_copy_ops = td_token_copy_ops_null;
@@ -4008,6 +4101,44 @@ int td_engine_stop(struct td_engine *eng)
 
 	return 0;
 }
+
+static int __td_engine_reset (struct td_engine *eng, void* data)
+{
+	int rc;
+
+	td_trace_reset(&eng->td_trace);
+
+	rc = td_eng_hal_enable(eng);
+	if (rc < 0) {
+		td_eng_err(eng, "Enabling of device %s failed, rc=%d\n",
+				eng->td_name, rc);
+		goto error_ops_enable;
+	}
+
+	td_run_state_enter(eng, INIT);
+
+error_ops_enable:
+	return rc;
+}
+
+int td_engine_reset (struct td_engine *eng)
+{
+	int rc;
+
+	struct td_eng_thread_work work = {
+		.name = "reset",
+		.func = __td_engine_reset,
+	};
+
+	td_eng_info(eng, "Resetting engine\n");
+	rc = td_eng_thread_work(eng, &work);
+	if (!rc)
+		rc= work.result;
+
+	return rc;
+
+}
+
 
 int td_engine_exit(struct td_engine *eng)
 {

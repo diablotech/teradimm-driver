@@ -1087,6 +1087,11 @@ int td_device_attach(struct td_device *dev, const char *group)
 	eng = td_device_engine(dev);
 	old_dg = dev->td_devgroup;
 	running = 0;
+	
+	if ( td_device_check_state(dev, USERMODE_EXCLUSIVE) ) {
+		td_eng_err(eng, "Device in USERMODE_EXCLUSIVE, cannot attach\n");
+		return -EPERM;
+	}
 
 	/* Check things that can fail */
 	dg = td_devgroup_get_by_name(group);
@@ -1199,27 +1204,12 @@ int td_device_reset(struct td_device *dev)
 	if (!td_devgroup_is_running(dg))
 		goto error_grp_stopped;
 
-	/* detach from current group, if any */
-	rc = td_devgroup_remove_device(dg, dev);
+	/*
+	 * Get the engine to reset itself, since it's running
+	 */
+	rc = td_engine_reset(eng);
 	if (rc)
-		goto error_remove_grp;
-
-	/* sync */
-	(void) td_devgroup_sync_device(dg, dev);
-
-	/* Verify the engine can start and is read */
-	rc = td_engine_start(td_device_engine(dev), 1);
-	if (rc < 0)
 		goto error_start;
-
-	/* Do the switch */
-	rc = td_devgroup_add_device(dg, dev);
-	if (rc)
-		goto error_add_to_grp;
-
-	/* wake up the thread */
-	td_devgroup_poke(dg);
-
 
 	/* We wait for at least a cycle through to see if it dies */
 	(void) td_devgroup_sync_device(dg, dev);
@@ -1228,30 +1218,13 @@ int td_device_reset(struct td_device *dev)
 		td_eng_err(eng, "Engine died");
 		goto error_completion;
 	}
-#if 0
-	rc = td_run_state_wait(eng, RUNNING);
-	if (rc < 0) {
-		td_eng_err(eng, "RUNNING was not reached: %d\n", rc);
-		goto error_completion;
-	}
-#endif
-	/* NOTE: returning with ref held on group,
-	 * returned in td_device_detach() */
-	return rc;
 
 error_completion:
-	td_engine_stop(td_device_engine(dev));
 error_start:
-/* add_to_grp fails, we re-attach to old. */
-error_remove_grp:
 error_grp_stopped:
 error_get_grp:
 	return rc;
 
-
-error_add_to_grp:
-	td_devgroup_put(dg);
-	return rc;
 }
 
 int td_device_shutdown(struct td_device *dev) {
@@ -1759,6 +1732,10 @@ int __td_device_ioctl(struct td_device* dev, unsigned int cmd,
 	td_device_lock(dev);
 
 	switch (cmd) {
+	case TD_IOCTL_DEVICE_USERMODE_EXCLUSIVE:
+		rc = td_ioctl_device_usermode_exclusive(dev, current);
+		break;
+
 	case TD_IOCTL_DEVICE_ATTACH:
 		/** ioctl used to attach a device to a device group */
 		rc = td_ioctl_device_attach(dev, k_arg->dg_name.group_name);
@@ -2027,9 +2004,10 @@ int td_device_go_offline(struct td_device *dev)
 	if (atomic_read(&dev->os.block_users))
 		return -EBUSY;
 
-	td_eng_hal_offline(td_device_engine(dev));
+	if (td_osdev_offline(&dev->os))
+		return -EBUSY;
 
-	td_osdev_offline(&dev->os);
+	td_eng_hal_offline(td_device_engine(dev));
 
 	td_device_enter_state(dev, OFFLINE);
 

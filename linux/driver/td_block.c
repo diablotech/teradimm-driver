@@ -503,7 +503,7 @@ error_capacity:
 	return rc;
 }
 
-void td_linux_block_unregister(struct td_osdev *dev)
+int td_linux_block_unregister(struct td_osdev *dev)
 {
 	WARN_DEVICE_UNLOCKED(dev);
 	WARN_ON(atomic_read(&dev->block_users));
@@ -516,6 +516,8 @@ void td_linux_block_unregister(struct td_osdev *dev)
 #ifdef CONFIG_PM
 	td_osdev_os_unregister_platform_device(dev);
 #endif
+
+	return 0;
 }
 
 

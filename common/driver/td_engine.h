@@ -84,6 +84,7 @@ extern int td_engine_init(struct td_engine *eng, struct td_device *dev);
 extern int td_engine_exit(struct td_engine *eng);
 
 extern int td_engine_start(struct td_engine *eng, int force_init);
+extern int td_engine_reset(struct td_engine *eng);
 extern int td_engine_reconfig(struct td_engine *eng);
 extern int td_engine_stop(struct td_engine *eng);
 extern int td_engine_resume(struct td_engine *eng);
@@ -1954,9 +1955,9 @@ static inline unsigned td_engine_queued_tasks(struct td_engine *eng)
 }
 #endif
 
-static inline int td_engine_has_dg_work (struct td_engine *eng)
+static inline int td_engine_has_thread_work (struct td_engine *eng)
 {
-	return !! td_atomic_ptr_read(&eng->td_safe_work);
+	return !! td_atomic_ptr_read(&eng->td_thread_work);
 }
 
 /** return number of commands and deallocations left to run */
@@ -2250,11 +2251,23 @@ struct td_eng_thread_work {
 	int verbose;
 };
 
-int __td_eng_run_safe_work (struct td_engine *eng, struct td_eng_thread_work *work);
+int __td_eng_run_thread_work (struct td_engine *eng, struct td_eng_thread_work *work);
+
+static inline int td_eng_thread_work(struct td_engine* eng, struct td_eng_thread_work* work)
+{
+	/* We need to be locked, to make sure everything stays around */
+	WARN_TD_DEVICE_UNLOCKED(td_engine_device(eng));
+
+	BUG_ON(!td_engine_devgroup(eng));
+	
+	return __td_eng_run_thread_work(eng, work);
+}
+
 static inline int td_eng_safe_work(struct td_engine* eng, struct td_eng_thread_work* work)
 {
-	struct td_devgroup *dg;
 	int rc, cpu, socket;
+
+	BUG_ON(!td_engine_devgroup(eng));
 
 	cpu = get_cpu();
 
@@ -2267,10 +2280,7 @@ static inline int td_eng_safe_work(struct td_engine* eng, struct td_eng_thread_w
 	socket = topology_physical_package_id(cpu);
 #endif
 
- 	dg = td_engine_devgroup(eng);
-	BUG_ON(!dg);
-
-	if (socket == dg->dg_socket) {
+	if (socket == td_engine_device(eng)->td_cpu_socket) {
 		/* we can execute it here, it's the right socket */
 		if (work->verbose)
 			td_eng_info(eng,
@@ -2285,7 +2295,7 @@ static inline int td_eng_safe_work(struct td_engine* eng, struct td_eng_thread_w
 
 	put_cpu();
 
-	return __td_eng_run_safe_work(eng, work);
+	return td_eng_thread_work(eng, work);
 }	
 
 

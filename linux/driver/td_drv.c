@@ -98,6 +98,6 @@ module_param_named(revision, td_revision, charp, 0000);
 MODULE_PARM_DESC(revision, TERADIMM_REVISION);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Diableo Technologies <info@diablo-technologies.com>");
+MODULE_AUTHOR("Diablo Technologies <info@diablo-technologies.com>");
 MODULE_DESCRIPTION("TeraDIMM block device driver.");
 MODULE_VERSION(TERADIMM_VERSION);
