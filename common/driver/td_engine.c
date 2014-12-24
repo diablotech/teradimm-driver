@@ -1,18 +1,49 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
  *                                                                       *
- *    Copyright (c) 2013 Diablo Technologies Inc. (Diablo).              *
- *    All rights reserved.                                               *
+ *    Copyright (c) 2013 Diablo Technologies Inc. ("Diablo").  All       *
+ *    rights reserved.                                                   *
  *                                                                       *
- *    This program is free software; you can redistribute it and/or      *
- *    modify it under the terms of the GNU General Public License        *
- *    as published by the Free Software Foundation; either version 2     *
- *    of the License, or (at your option) any later version located at   *
- *    <http://www.gnu.org/licenses/                                      *
+ *    This software is being licensed under a dual license, at Diablo's  *
+ *    sole discretion.                                                   *
  *                                                                       *
- *    This program is distributed WITHOUT ANY WARRANTY; without even     *
- *    the implied warranty of MERCHANTABILITY or FITNESS FOR A           *
- *    PARTICULAR PURPOSE.  See the GNU General Public License for        *
- *    more details.                                                      *
+ *    GPL License                                                        *
+ *                                                                       *
+ *    If you do not have explicit permission from Diablo, then you may   *
+ *    only redistribute it and/or modify it under the terms of the GNU   *
+ *    General Public License as published by the Free Software           *
+ *    Foundation; either version 2 of the License, or (at your option)   *
+ *    any later version located at <http://www.gnu.org/licenses/>.  See  *
+ *    the GNU General Public License for more details.                   *
+ *                                                                       *
+ *    Modified BSD License                                               *
+ *                                                                       *
+ *    If you have explicit permission from Diablo, then (1) use in       *
+ *    source and binary forms, with or without modification; as well as  *
+ *    (2) redistribution ONLY in binary form, with or without            *
+ *    modification; are permitted provided that the following conditions *
+ *    are met:                                                           *
+ *                                                                       *
+ *    * Redistributions in binary form must reproduce the above          *
+ *    copyright notice, this list of conditions and the following        *
+ *    disclaimer in the documentation and/or other materials provided    *
+ *    with the distribution.                                             *
+ *                                                                       *
+ *    * Neither the name of the DIABLO nor the names of its contributors *
+ *    may be used to endorse or promote products derived from this       *
+ *    software without specific prior written permission.                *
+ *                                                                       *
+ *    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND             *
+ *    CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,        *
+ *    INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF           *
+ *    MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE           *
+ *    DISCLAIMED. IN NO EVENT SHALL DIABLO BE LIABLE FOR ANY DIRECT,     *
+ *    INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES *
+ *    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR *
+ *    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) *
+ *    HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN          *
+ *    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR       *
+ *    OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,     *
+ *    EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.                 *
  *                                                                       *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -1325,8 +1356,17 @@ static void td_request_start_write(struct td_token *tok)
 			tok->use_wep_alias = 1;
 			/* fall though desired */
 		case 1:
+			/* Let's do this write from cache */
+			tok->cache.data = eng->wep_cache.data;
+			tok->cache.meta = eng->wep_cache.meta;
 			td_eng_trace(eng, TR_CMD, "write-data-again", tok->use_wep_alias);
 			rc = td_eng_hal_write_page(eng, tok);
+
+			/* And clear our cache */
+			tok->cache.data = tok->cache.meta = NULL;
+
+			/* And clear this for a token failures re-write */
+			tok->use_wep_alias = 0;
 			break;
 		}
 	}
@@ -2206,7 +2246,7 @@ static int td_engine_SEC_completion(struct td_token*);
  * the associated data with it will all be the same as the 1st.
  */
 static struct td_token *td_engine_construct_token_for_SEC_bio(struct td_engine *eng,
-		struct td_io_begin_state *bs, int use_extra_wep)
+		struct td_io_begin_state *bs)
 {
 	struct td_token *tok1, *tok2;
 	uint write_size=0, read_size=0;
@@ -2228,19 +2268,11 @@ static struct td_token *td_engine_construct_token_for_SEC_bio(struct td_engine *
 	if (unlikely(!tok2))
 		goto error_alloc_tok2;
 
-	if (use_extra_wep) {
-		tok1->extra_wr_bufid = td_alloc_wr_buffer(eng);
-		if (!TD_IS_WR_BUFID_VALID(tok1->extra_wr_bufid))
-			goto error_alloc_extra_wep;
-	}
-
 	/* update resources remaining */
 	bs->core_avail -= 2;
 	bs->tok_avail -= 2;
 	if (write_size)
 		bs->wr_avail -= 2;
-	if (use_extra_wep)
-		bs->wr_avail --;
 
 	/* set magic flags as needed */
 	tok2->magic_flags = tok1->magic_flags = (uint8_t)td_eng_conf_var_get(eng, MAGIC_FLAGS);
@@ -2280,9 +2312,6 @@ static struct td_token *td_engine_construct_token_for_SEC_bio(struct td_engine *
 
 	return tok1;
 
-error_alloc_extra_wep:
-	td_free_all_buffers(eng, tok2);
-	td_free_token(eng, tok2);
 error_alloc_tok2:
 	td_free_all_buffers(eng, tok1);
 	td_free_token(eng, tok1);
@@ -2358,13 +2387,8 @@ static struct td_token *td_engine_construct_token_for_bio(struct td_engine *eng,
 		 */
 		switch (td_bio_flags_ref(bio)->commit_level) {
 		case TD_SUPER_EARLY_COMMIT:
-			/* this is the original SEC mode that uses 2 WEPs */
+			/* this isl SEC mode that uses 2 WEPs */
 			weps_needed = 2;
-			break;
-
-		case TD_TRIPLE_SEC:
-			/* enhanced reliability from a third WEP */
-			weps_needed = 3;
 			break;
 
 		default:
@@ -2379,8 +2403,7 @@ static struct td_token *td_engine_construct_token_for_bio(struct td_engine *eng,
 					bs->tok_avail << 16 
 					| bs->wr_avail << 8 
 					| bs->core_avail);
-			return td_engine_construct_token_for_SEC_bio(eng, bs,
-					weps_needed == 3);
+			return td_engine_construct_token_for_SEC_bio(eng, bs);
 		}
 
 		write_size = td_bio_get_byte_size(bio);

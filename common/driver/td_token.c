@@ -1,18 +1,49 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
  *                                                                       *
- *    Copyright (c) 2013 Diablo Technologies Inc. (Diablo).              *
- *    All rights reserved.                                               *
+ *    Copyright (c) 2013 Diablo Technologies Inc. ("Diablo").  All       *
+ *    rights reserved.                                                   *
  *                                                                       *
- *    This program is free software; you can redistribute it and/or      *
- *    modify it under the terms of the GNU General Public License        *
- *    as published by the Free Software Foundation; either version 2     *
- *    of the License, or (at your option) any later version located at   *
- *    <http://www.gnu.org/licenses/                                      *
+ *    This software is being licensed under a dual license, at Diablo's  *
+ *    sole discretion.                                                   *
  *                                                                       *
- *    This program is distributed WITHOUT ANY WARRANTY; without even     *
- *    the implied warranty of MERCHANTABILITY or FITNESS FOR A           *
- *    PARTICULAR PURPOSE.  See the GNU General Public License for        *
- *    more details.                                                      *
+ *    GPL License                                                        *
+ *                                                                       *
+ *    If you do not have explicit permission from Diablo, then you may   *
+ *    only redistribute it and/or modify it under the terms of the GNU   *
+ *    General Public License as published by the Free Software           *
+ *    Foundation; either version 2 of the License, or (at your option)   *
+ *    any later version located at <http://www.gnu.org/licenses/>.  See  *
+ *    the GNU General Public License for more details.                   *
+ *                                                                       *
+ *    Modified BSD License                                               *
+ *                                                                       *
+ *    If you have explicit permission from Diablo, then (1) use in       *
+ *    source and binary forms, with or without modification; as well as  *
+ *    (2) redistribution ONLY in binary form, with or without            *
+ *    modification; are permitted provided that the following conditions *
+ *    are met:                                                           *
+ *                                                                       *
+ *    * Redistributions in binary form must reproduce the above          *
+ *    copyright notice, this list of conditions and the following        *
+ *    disclaimer in the documentation and/or other materials provided    *
+ *    with the distribution.                                             *
+ *                                                                       *
+ *    * Neither the name of the DIABLO nor the names of its contributors *
+ *    may be used to endorse or promote products derived from this       *
+ *    software without specific prior written permission.                *
+ *                                                                       *
+ *    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND             *
+ *    CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,        *
+ *    INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF           *
+ *    MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE           *
+ *    DISCLAIMED. IN NO EVENT SHALL DIABLO BE LIABLE FOR ANY DIRECT,     *
+ *    INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES *
+ *    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR *
+ *    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) *
+ *    HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN          *
+ *    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR       *
+ *    OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,     *
+ *    EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.                 *
  *                                                                       *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -84,10 +115,17 @@ static int td_token_virt_to_dev(struct td_token *tok,
 	char *src = (char*)tok->host_buf_virt;
 	uint data_len = tok->len_host_to_dev;
 
+	if (tok->cache.data) {
+		/* If we have a cache, use it */
+		src = tok->cache.data;
+		td_eng_trace(eng, TR_TOKEN, "virt_to_dev:cache", (uint64_t)src);
+	}
+
 	td_eng_trace(eng, TR_TOKEN, "virt_to_dev:bufvirt[0] ",
 			((uint64_t*)src)[0]);
 
 	tok->data_xsum[0] = tok->data_xsum[1] = 0;
+
 
 	td_memcpy_8x8_movnti_xsum128(dst, src,
 			data_len, tok->data_xsum);
@@ -115,6 +153,12 @@ static int td_token_virt_to_multi_dev(struct td_token *tok,
 	struct td_engine *eng = td_token_engine(tok);
 	char *src = (char*)tok->host_buf_virt;
 	uint data_len = tok->len_host_to_dev;
+
+	if (tok->cache.data) {
+		/* If we have a cache, use it */
+		src = tok->cache.data;
+		td_eng_trace(eng, TR_TOKEN, "virt_to_dev:cache", (uint64_t)src);
+	}
 
 	td_eng_trace(eng, TR_TOKEN, "virt_to_dev:bufvirt[0] ",
 			((uint64_t*)src)[0]);
