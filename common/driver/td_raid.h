@@ -59,14 +59,29 @@
 #include "td_engine_def.h"
 #include "td_params.h"
 
+#define TD_RAID_THREAD_NAME_PREFIX      "mcs/"
+
 struct tr_member {
 	struct td_device *trm_device;
-	struct td_ucmd *ucmd;
+	struct td_ucmd *trm_ucmd;
 	uint8_t trm_uuid[TD_UUID_LENGTH];
 	enum td_raid_member_state trm_state;
+	uint64_t trm_generation;
+	uint64_t trm_counter[TR_MEMBER_COUNT_MAX];
 };
 
 struct td_raid;
+
+struct td_raid_resync_context {
+	/* Pointer to thread performing the resync */
+	struct task_struct *resync_task;
+	
+	spinlock_t              trs_bio_lock;     /**< queue lock */
+	int (*_trs_queue_bio) (struct td_raid *rdev, td_bio_ref bio);
+
+	struct bio_list         trs_bios;         /**< requests from inbound layer */
+	uint64_t                trs_bio_count;
+};
 
 struct td_raid_ops {
 	/* prepare raid according to this type */
@@ -77,16 +92,22 @@ struct td_raid_ops {
 
 	int (*_get_conf)(struct td_raid *, uint32_t conf, uint64_t *val);
 	int (*_set_conf)(struct td_raid *, uint32_t conf, uint64_t val);
+	
+	int (*_get_counter)(struct td_raid *, uint32_t var, uint64_t *val);
 
 	/* Check a member being added */
-	int (*_check_member)(struct td_raid *, struct td_device *dev, int first);
+	int (*_check_member)(struct td_raid *, struct td_device *dev);
+	int (*_handle_member)(struct td_raid *, int idx);
+	int (*_fail_member)(struct td_raid *, int idx);
 
 	/* Prepare for online */
 	int (*_online)(struct td_raid *);
 	
 	/* Handle a BIO request */
 	int (*_request) (struct td_raid *rdev, td_bio_ref bio);
-	int (*_degraded_request) (struct td_raid *rdev, td_bio_ref bio);
+
+	/* Resync volume */
+	int (*_resync)(struct td_raid *);
 };
 
 struct td_raid {
@@ -95,7 +116,8 @@ struct td_raid {
 	/**
 	 * Basic raid config, what level, how many, whos active, etc
 	 */
-	uint64_t           tr_member_mask;  /**< Mask of active members present */
+	uint64_t           tr_member_set;  /**< Mask of members present */
+	uint64_t           tr_active_set;  /**< Mask of active members present */
 
 	struct {
 		uint64_t general[TR_CONF_GENERAL_MAX];
@@ -103,16 +125,52 @@ struct td_raid {
 
 	struct tr_member   *tr_members;
 
-	enum td_raid_state_type tr_state; /**< current device state */
-	struct completion  tr_state_change_completion; /**< used to notify state changes */
+	enum td_raid_dev_state tr_dev_state; /**< current device state */
+	enum td_raid_run_state tr_run_state; /** Raid state */
 
-	
+	uint64_t               tr_generation;
+
+	uint64_t    counter[TR_GENERAL_COUNT_MAX];
+
 	struct td_raid_ops	*ops;
 	void*                   ops_priv;
+	unsigned                ops_counter_max;
 
-	/* Used for params */
-	struct page             *tr_meta_page;
+	struct td_raid_resync_context     resync_context;
 };
+
+
+
+
+/*
+ * Some bit ops for our member mask 
+ */
+#define TR_BITSET_TEST(_bs, idx)   !(((_bs) & (1UL << idx))==0)
+
+#define TR_BITSET_SET(_bs, idx)    do { (_bs) |= (1UL << idx);    } while (0)
+#define TR_BITSET_FLIP(_bs, idx)   do { (_bs) ^= (1UL<< idx);     } while (0)
+#define TR_BITSET_CLEAR(_bs, idx)  do { (_bs) &= ~(1UL << idx);   } while (0)
+
+#define TR_BITSET_FULL(_bs, _count)((_bs) == (1UL << _count) - 1)
+#define TR_BITSET_EMPTY(_bs)       ((_bs) == 0UL)
+
+
+
+#define TR_MEMBERSET_TEST(_r, idx)    TR_BITSET_TEST(_r->tr_member_set, idx)
+#define TR_MEMBERSET_SET(_r, idx)     TR_BITSET_SET(_r->tr_member_set, idx)
+#define TR_MEMBERSET_FLIP(_r, idx)    TR_BITSET_FLIP(_r->tr_member_set, idx)
+#define TR_MEMBERSET_CLEAR(_r, idx)   TR_BITSET_CLEAR(_r->tr_member_set, idx)
+#define TR_MEMBERSET_FULL(_r)         TR_BITSET_FULL(_r->tr_member_set, tr_conf_var_get(_r, MEMBERS))
+#define TR_MEMBERSET_EMPTY(_r)        TR_BITSET_EMPTY(_r->tr_member_set)
+
+#define TR_ACTIVESET_TEST(_r, idx)    TR_BITSET_TEST(_r->tr_active_set, idx)
+#define TR_ACTIVESET_SET(_r, idx)     TR_BITSET_SET(_r->tr_active_set, idx)
+#define TR_ACTIVESET_FLIP(_r, idx)    TR_BITSET_FLIP(_r->tr_active_set, idx)
+#define TR_ACTIVESET_CLEAR(_r, idx)   TR_BITSET_CLEAR(_r->tr_active_set, idx)
+#define TR_ACTIVESET_FULL(_r)         TR_BITSET_FULL(_r->tr_active_set, tr_conf_var_get(_r, MEMBERS))
+#define TR_ACTIVESET_EMPTY(_r)        TR_BITSET_EMPTY(_r->tr_active_set)
+
+
 
 #define td_raid_emerg(dev,fmt,...)    td_os_emerg(&(dev)->os, fmt, ##__VA_ARGS__)
 #define td_raid_alert(dev,fmt,...)    td_os_alert(&(dev)->os, fmt, ##__VA_ARGS__)
@@ -136,11 +194,26 @@ static inline const char* td_raid_name (struct td_raid *dev)
 	return dev->os.name;
 }
 
-#define td_raid_check_state(rdev, check_state) \
-	((rdev)->tr_state == TD_RAID_STATE_##check_state)
+#define tr_check_dev_state(rdev, check_state) \
+	((rdev)->tr_dev_state == TD_RAID_STATE_##check_state)
 
-#define td_raid_enter_state(rdev, new_state) ({ \
-	(rdev)->tr_state = TD_RAID_STATE_ ## new_state; \
+#define tr_enter_dev_state(rdev, new_state) ({ \
+	(rdev)->tr_dev_state = TD_RAID_STATE_ ## new_state; \
+	})
+
+#define tr_check_run_state(rdev, check_state) \
+	((rdev)->tr_run_state == TR_RUN_STATE_##check_state)
+
+#define tr_enter_run_state(rdev, new_state) ({ \
+	(rdev)->tr_run_state = TR_RUN_STATE_ ## new_state; \
+	})
+
+
+#define tr_raid_member_check_state(trm, check_state) \
+	((trm)->trm_state == TR_MEMBER_##check_state)
+
+#define tr_raid_member_enter_state(trm, new_state) ({ \
+	(trm)->trm_state = TR_MEMBER_ ## new_state; \
 	})
 
 extern int __init td_raid_init(void);
@@ -181,8 +254,9 @@ extern int td_raid_get_conf(struct td_raid *dev, enum td_raid_conf_type conf,
 extern int td_raid_go_online(struct td_raid *dev);
 extern int td_raid_go_offline(struct td_raid *dev);
 
+/* Meta data */
+void td_raid_save_meta (struct td_raid *rdev, int wait);
 
-#define td_raid_state(_r) (_r->tr_state)
 
 /* macros */
 static inline void td_raid_lock(struct td_raid *rdev)
@@ -202,6 +276,13 @@ static inline void td_raid_unlock(struct td_raid *rdev)
 	td_raid_debug(rdev, "CONF %s set to %llu\n", __stringify(which), (rdev)->conf.general[TR_CONF_GENERAL_##which]); \
 	} while (0)
 
+
+/*
+ * Private API, mainly exposed for raid types to use
+ */
+
+int td_raid_change_member(struct td_raid *rdev, int idx, enum td_raid_member_state state);
+int td_raid_fail_member(struct td_raid *rdev, int idx);
 
 #endif
 

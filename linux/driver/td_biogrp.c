@@ -50,119 +50,157 @@
  *                                                                       *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#ifndef _TD_BIO_H_
-#define _TD_BIO_H_
-
-/*
- * The intent of this file is to make it easy to implement wrappers around
- * any OS native block request structures
- */
-
 #include "td_kdefn.h"
 
-#include "td_defs.h"
+
 #include "td_compat.h"
-/* Pre-declare this, for the endio function argument */
-struct td_engine;
 
-/*
- * These are the forward declarations of BIO stuff that needs
- * to be supported by all the platforms
- */
-typedef struct bio td_bio_t;
-typedef struct bio * td_bio_ref;
+#include "td_defs.h"
+#include "td_bio.h"
+#include "td_util.h"
+#include "td_device.h"
+#include "td_engine.h"
+#include "td_osdev.h"
 
-/*
- * This is the BIO API that the engine uses:
- *  - Get/set byte/sector info
- *  - Get/set flags
- *  - end BIO
- */
-static inline unsigned int td_bio_get_byte_size(td_bio_ref ref);
-static inline void         td_bio_set_byte_size(td_bio_ref ref, unsigned size);
+#define TD_SPLIT_TRIM_SIZE      512
 
-static inline uint64_t td_bio_get_sector_offset(td_bio_ref ref);
-static inline void     td_bio_set_sector_offset(td_bio_ref ref, uint64_t s);
 
-static inline int td_bio_is_sync(td_bio_ref ref);
-static inline int td_bio_is_discard(td_bio_ref ref);
-static inline int td_bio_is_write(td_bio_ref ref);
-
-static inline int td_bio_is_read(td_bio_ref ref)
+int td_bio_split (td_bio_ref obio, unsigned split_size,
+		td_split_req_create_cb cb, void *opaque)
 {
-	return ! td_bio_is_write(ref);
+	struct td_biogrp_options ops = {
+		.split_size = split_size,
+		.duplicate_count = 1,
+		.submit_part = cb,
+		.error_part = NULL,
+	};
+
+	return td_biogrp_create(obio, &ops, opaque);
 }
 
-
-/*
- * These are few "flags" that we need to keep with BIOs
- */
-static inline enum td_commit_type td_bio_flags_get_commitlevel (td_bio_ref ref);
-static inline void                td_bio_flags_set_commitlevel (td_bio_ref ref, enum td_commit_type cl);
-
-static inline int td_bio_is_part(td_bio_ref ref);
-
-/*
- * The main "bio endio" function
- */
-extern void td_bio_endio(struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts);
-
-/* This is a support function in td_trim.c */
-extern int td_bio_trim_count(td_bio_ref bio, struct td_engine *eng);
-
-/*
- * BIOGRP API
- * 
- * This is the API that the RAID code relies on for bio groups
- * BIO Groups are created by the OS-specific block layer front-ends, and the
- * member BIOs of them are submitted to the device engines.
- *
- * The OS can implement the bio groups as it sees fit.  The raid code only needs
- * a common entry point to "create" the groupings, and a way to get the
- * failure of a part back from the BIOGRP code when a chunk fails.
- *
- * The bio part failure back information needs to get back into the raid code
- * so the raid can handle errors appropriately.
- *
- * The error_part function returns an INT.  A return value of 0 means that
- * the failure was over-ruled.  No further processing can happen, because the
- * error handler did something special with that part.  It as arranged that
- * the part will be finished again at some other time.
- * A return value of non-zero means to complete the part, with the returned
- * value as the result to use for the td_biogrp.
- */
-
-struct td_biogrp;
-
-struct td_biogrp_options
+int td_bio_replicate (td_bio_ref obio, int num_bios,
+		td_split_req_create_cb cb, void *opaque)
 {
-	unsigned        split_size;
-	unsigned        duplicate_count;
-	void            (*submit_part) (struct td_biogrp *grp,
-					td_bio_ref bio, void* opaque);
-	int             (*error_part) (struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts);
-};
+	struct td_biogrp_options ops =
+	{
+		.split_size = TD_PAGE_SIZE,
+		.duplicate_count = num_bios,
+		.submit_part = cb,
+		.error_part = NULL,
+	};
 
-extern int td_biogrp_create (td_bio_ref obio, struct td_biogrp_options *ops,
-		void* opaque);
+	return td_biogrp_create(obio, &ops, opaque);
 
+}
 
+static void td_split_req_create_list_cb(struct td_biogrp *sreq,
+		td_bio_ref new_bio, void *opaque)
+{
+	struct bio_list *split_bios = opaque;
 
-#ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
+	bio_list_add(split_bios, new_bio);
+}
+
+int __td_split_req_create_list(struct td_engine *eng, td_bio_ref orig_bio,
+		struct td_biogrp **out_sreq, struct bio_list *split_bios)
+{
+	return (td_bio_is_discard(orig_bio) ?
+		td_split_req_create_discard(eng, orig_bio,
+			td_split_req_create_list_cb, split_bios) :
+		td_bio_split(orig_bio, TERADIMM_DATA_BUF_SIZE,
+			td_split_req_create_list_cb, split_bios) );
+}
+
 /*
- * If we are offloading successful endio, this is how the devgroup code
- * calls it
+ * DEFAULT split allocation is via kzalloc/kfree
  */
-static inline void td_bio_complete_success (td_bio_ref bio);
+static void td_biogrp_dealloc_kfree(struct td_biogrp *sreq)
+{
+	kfree(sreq);
+}
+
+struct td_biogrp* td_biogrp_alloc( unsigned int extra)
+{
+	struct td_biogrp *sreq;
+	int size = sizeof(struct td_biogrp) + extra;
+
+	if ((sreq = kzalloc(size, GFP_KERNEL)) ) {
+		sreq->_dealloc = td_biogrp_dealloc_kfree;
+	}
+	return sreq;
+	
+}
+struct td_biogrp* td_biogrp_alloc_kzalloc(struct td_engine* eng,
+		unsigned int extra)
+{
+	struct td_biogrp *sreq;
+	sreq = td_biogrp_alloc(extra);
+	td_eng_trace(eng, TR_BIO, "split:malloc:alloc", (uint64_t)sreq);
+	return sreq;
+}
+
+#ifdef CONFIG_TERADIMM_PRIVATE_SPLIT_STASH
+
+static void td_biogrp_dealloc_stash (struct td_biogrp *sreq)
+{
+	td_stash_dealloc(sreq);
+}
+
+struct td_biogrp* td_stash_biogrp_alloc (struct td_engine *eng,
+		unsigned int extra)
+{
+	struct td_stash_info *info = eng->td_split_stash;
+	int size = sizeof(struct td_biogrp) + extra;
+	
+
+	struct td_biogrp *sreq  =td_stash_alloc(info, size);
+
+	if (unlikely(sreq == NULL))
+		return td_biogrp_alloc_kzalloc(eng, extra);
+
+	sreq->_dealloc = td_biogrp_dealloc_stash;
+	td_eng_trace(eng, TR_BIO, "split:stash:alloc", (uint64_t)sreq);
+	return sreq;
+}
+
 #endif
 
-#include "td_bio_linux.h"
+void __td_biogrp_complete_part(struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts)
+{
+	struct td_biogrp *bgrp = td_bio_group(bio);
+	int done, total;
 
+	/* if nothing failed yet, update the biogrp status */
+	if (result && ! bgrp->sr_result)
+		bgrp->sr_result = result;
 
+	/*
+	 * Mark another piece as as done
+	 * 
+	 * Be very careful here.  Afer we've done our atomic_inc_return, we
+	 * can't touch the biogrp anymore, unless we we are the one that
+	 * finishes it.  If we didn't finish it, another CPU could be
+	 * finishing it while this CPU could be in an interrupt and delaying
+	 * us until the other CPU has free()'d it.
+	 *
+	 */
+	total = bgrp->sr_parts;
+	done = atomic_inc_return(&bgrp->sr_finished);
 
-#ifndef KABI__bio_list
-#include "lk_biolist.h"
-#endif
+	/* return if there are outstanding parts, our inc wasn't the last one */
+	if (done < total)
+		return;
 
-#endif
+	WARN_ON(done != total);
+
+	/*
+	 * We are the one that finished it, it's all ours now, nobody else
+	 * will touch it
+	 */
+
+	td_bio_endio(eng, bgrp->sr_orig, bgrp->sr_result,
+			td_get_cycles() - bgrp->sr_created);
+	td_biogrp_free(bgrp);
+}
+
 

@@ -98,8 +98,9 @@
 #define TERADIMM_ACCESS_BLOCK_SHIFT   17  /*  2^17 is 128M */
 
 /* an address has 33 bits */
-#define TERADIMM_ADDRESS_BITS         33  /*  2^33 is 8G */
-#define TERADIMM_ADDRESS_MASK         ( (1ULL << TERADIMM_ADDRESS_BITS) - 1 )
+#define TERADIMM_ADDRESS_BITS         32  /*  2^32 is 4G */
+#define TERADIMM_ADDRESS_MAX          ( 1ULL << TERADIMM_ADDRESS_BITS )
+#define TERADIMM_ADDRESS_MASK         ( TERADIMM_ADDRESS_MAX - 1 )
 
 /* enumeration of buffer types */
 enum teradimm_buf_type {
@@ -146,10 +147,13 @@ enum teradimm_buf_type {
 #endif
 
 static inline off_t teradimm_offset(enum teradimm_buf_type type,
-		uint alias, uint bufs_per_alias, uint buf_index)
+		uint alias, uint bufs_per_alias, uint buf_index,
+		uint64_t avoid_mask)
 {
 	off_t block_index;
 	off_t ofs;
+	off_t shift_mask = 0;
+	off_t cur_bit = 0;
 
 	/* convert 2 dimensional coordinates into a linear one */
 	block_index = (alias * bufs_per_alias) + buf_index;
@@ -158,11 +162,26 @@ static inline off_t teradimm_offset(enum teradimm_buf_type type,
 	ofs = (off_t)type << TERADIMM_ACCESS_TYPE_SHIFT
 	    | block_index << TERADIMM_ACCESS_BLOCK_SHIFT;
 
+	for (cur_bit = 0 ; cur_bit < TERADIMM_ADDRESS_BITS ; cur_bit++) {
+		if (avoid_mask & (1ULL << cur_bit)) {
+			ofs = ( (ofs & shift_mask)
+				    | (((ofs & (~shift_mask)) << 1)) );
+		}
+		shift_mask |= (1ULL << cur_bit);
+	}
+
+	if (ofs & avoid_mask || ofs >= TERADIMM_ADDRESS_MAX) {
+		pr_err("BAD %u:%u:%u:%u OFFSET %0lx (%0llx)\n",
+				type, alias, bufs_per_alias, buf_index, ofs,
+				ofs & avoid_mask);
+	}
+
 	/* return the least significant 33 bits */
 	return ofs & TERADIMM_ADDRESS_MASK;
 }
-#define TERADIMM_OFFSET(type,alias,index) \
-	teradimm_offset(TERADIMM_##type, alias, TERADIMM_##type##_MAX, index)
+#define TERADIMM_OFFSET(type,alias,index,avoid_mask) \
+	teradimm_offset(TERADIMM_##type, alias, \
+			TERADIMM_##type##_MAX, index, avoid_mask)
 
 /* offset between current read buffer and next alias */
 #define TERADIMM_OFFSET_TO_NEXT_ALIAS(type) \

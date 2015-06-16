@@ -364,17 +364,6 @@ void __td_osdev_destroy(struct td_osdev *dev)
 
 /* ---- external interface ---- */
 
-
-void td_osdev_error_bio (td_bio_ref bio)
-{
-	struct td_osdev *odev = bdev_compat_pdata_dev(bio->bi_bdev);
-	
-	if (odev->_bio_error)
-		odev->_bio_error(odev, bio);
-
-	td_bio_complete_failure(bio);
-}
-
 /* Linux CHAR MISC sybsystem */
 
 static int __check_dev_miscdev_minor(struct td_osdev *dev, void* data)

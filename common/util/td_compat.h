@@ -59,6 +59,11 @@
 #include "td_compat_linux.h"
 #endif
 
+#ifndef CONFIG_TRACING
+#undef trace_printk
+#define trace_printk(fmt,a...) do { /* nothing */ } while(0)
+#endif
+
 #if !defined(BITS_PER_LONG)
 #  if defined(__x86_64) || defined(__x86_64__) || (__WORDSIZE == 64)
 #    define BITS_PER_LONG 64
@@ -386,39 +391,10 @@ static inline void* td_atomic_ptr_xchg (td_atomic_ptr_t *ptr, void* d)
 #endif
 
 /* Taken from linux/types.h 3.15-rc1 */
+#ifdef __KERNEL__
 #ifndef KABI__uintptr
 typedef unsigned long             uintptr_t;
 #endif
-
-#ifdef KABI__bio_bi_size
-/* Linux git commit 4f024f37 changed the bio struct*/
-#define bio_size        bi_size
-#define bio_sector      bi_sector
-#define bio_idx         bi_idx
-#define td_bvec_iter    int
-#define td_bv_idx(x)    x
-
-/* Create our own for_each to use bvec and not *bvec. */
-#define td_bio_for_each_segment(bvec, bio, iter)                       \
-        for (iter = (bio)->bi_idx;                                     \
-             bvec = (bio)->bi_io_vec[iter], iter < (bio)->bi_vcnt;     \
-             iter++)
-
-#else
-
-#define bio_size        bi_iter.bi_size
-#define bio_sector      bi_iter.bi_sector
-#define bio_idx         bi_iter.bi_idx
-#define td_bvec_iter    struct bvec_iter
-#define td_bv_idx(x)    x.bi_idx
-
-#define td_bio_for_each_segment(bvec, bio, iter) \
-	bio_for_each_segment(bvec, bio, iter)
-#endif
-
-#ifndef bio_iovec_idx
-/* Removed in 3.13 */
-#define bio_iovec_idx(bio, idx) (&((bio)->bi_io_vec[(idx)]))
 #endif
 
 #endif

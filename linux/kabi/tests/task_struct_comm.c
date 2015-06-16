@@ -1,4 +1,3 @@
-#define __KERNEL__
 #include <linux/init_task.h>
 #include <linux/export.h>
 #include <linux/sched.h>

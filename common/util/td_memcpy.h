@@ -124,7 +124,17 @@ MEMCPY_INLINE void td_memcpy_8x8_movnti_xsum128_e2e(void *dst,
 
 MEMCPY_INLINE void td_memcpy_8B_movnti(void *dst, const void *src);
 
+MEMCPY_INLINE int td_memcpy_alias_compare(void *dst, const void *src, const void *alias, unsigned int len);
+MEMCPY_INLINE void td_memcpy_cached_alias_compare(void *dst, const void *src, void *cache, const void *alias, unsigned int len);
+MEMCPY_INLINE int td_memcpy_cached_alias_compare_test(void *dst, const void const *const src_alias[2], void *cache, unsigned int len);
+
+
+/* These are the alias/cache compare NCWC/FPU copies for RDBUF DI */
 MEMCPY_INLINE void td_memcpy_movntdqa_64(void *dst, const void *src, unsigned int len);
+MEMCPY_INLINE int td_memcpy_movntdqa_64_alias_compare(void *dst, const void *src, const void *alias, unsigned int len);
+MEMCPY_INLINE void td_memcpy_movntdqa_64_cached_alias_compare(void *dst, const void *src, void *cache, const void *alias, unsigned int len);
+MEMCPY_INLINE int td_memcpy_movntdqa_64_cached_alias_compare_test(void *dst, const void *src, void *cache, const void *alias, unsigned int len);
+
 MEMCPY_INLINE void td_memcpy_movntdqa_16(void *dst, const void *src, unsigned int len);
 
 MEMCPY_INLINE void td_zero_8B_movnti(void *dst);
@@ -137,8 +147,7 @@ MEMCPY_INLINE void td_memcpy_4x16_movntq_cli_64B(void *dst, const void *src);
 
 MEMCPY_INLINE void td_fill_8x8_movnti(void *dst, uint64_t word, unsigned int len);
 
-MEMCPY_INLINE void td_memcpy_8x8_movq_bad_clflush(void *dst, const void *const src_alias[2],
-		unsigned int len, uint64_t bad);
+MEMCPY_INLINE void td_memcpy_8x8_movq_bad_clflush(void *dst, const void *const src_alias[2], unsigned int len, uint64_t bad);
 
 #ifdef MEMCPY_INLINE_FILE_IMPL
 #include MEMCPY_INLINE_FILE_IMPL

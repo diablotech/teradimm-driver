@@ -128,7 +128,7 @@ void td_eng_reset_retry_timeout_handler(struct td_engine *eng,
 			list_add_tail(&tok->link, complete_list);
 			continue;
 		}
-		eng->td_counters.token.resets_cnt ++;
+		td_eng_counter_token_inc(eng, RESETS_CNT);
 
 		/* when this reset command completes, it will be retried */
 		tok->needs_retry = 1;

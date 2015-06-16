@@ -65,6 +65,10 @@
 #include "td_ioctl.h"
 #include "td_ucmd.h"
 
+#if 1
+extern int tr_mirror_resync (struct td_raid *rdev);
+#endif
+
 /**
  * set a configuration variable
  *
@@ -459,13 +463,11 @@ int td_device_get_counter(struct td_device *dev,
 {
 	int rc = -ENOENT;
 	struct td_engine *eng;
-	uint64_t *reg = NULL;
-	uint64_t offset = 0;
+	uint64_t reg = 0ULL;
 	WARN_TD_DEVICE_UNLOCKED(dev);
 
 	if (type >= TD_DEVICE_COUNTER_TYPE_MAX)
 		goto bail;
-
 
 	eng = td_device_engine(dev);
 
@@ -476,37 +478,36 @@ int td_device_get_counter(struct td_device *dev,
 	case TD_DEVICE_COUNTER_READ:
 		if (cntr_num >= TD_DEV_GEN_COUNT_MAX)
 			goto bail;
-		offset = TD_DEV_GEN_COUNTER_READ_DATA(cntr_num);
+		reg = eng->counters.read[cntr_num];
 		break;
 
 	case TD_DEVICE_COUNTER_WRITE:
 		if (cntr_num >= TD_DEV_GEN_COUNT_MAX)
 			goto bail;
-		offset = TD_DEV_GEN_COUNTER_WRITE_DATA(cntr_num);
+		reg = eng->counters.write[cntr_num];
 		break;
 
 	case TD_DEVICE_COUNTER_CONTROL:
 		if (cntr_num >= TD_DEV_GEN_COUNT_MAX)
 			goto bail;
-		offset = TD_DEV_GEN_COUNTER_CONTROL_DATA(cntr_num);
+		reg = eng->counters.control[cntr_num];
 		break;
 
 
 	case TD_DEVICE_COUNTER_TOKEN:
 		if (cntr_num >= TD_DEV_TOKEN_COUNT_MAX)
 			goto bail;
-		offset = TD_DEV_TOKEN_COUNTER_DATA(cntr_num);
+		reg = eng->counters.token[cntr_num];
 		break;
 
 	case TD_DEVICE_COUNTER_MISC:
 		if (cntr_num >= TD_DEV_MISC_COUNT_MAX)
 			goto bail;
-		offset = TD_DEV_MISC_COUNTER_DATA(cntr_num);
+		reg = eng->counters.misc[cntr_num];
 		break;
 	}
 
-	reg = &eng->td_counters.data[offset];
-	*val = *reg;
+	*val = reg;
 	rc = 0;
 bail:
 	return rc;
@@ -514,7 +515,7 @@ bail:
 }
 
 int td_ioctl_device_get_counters(struct td_device *dev,
-		struct td_ioctl_device_counters *cntrs, bool fill_mode)
+		struct td_ioctl_counters *cntrs, bool fill_mode)
 {
 	int i, rc = -EINVAL;
 
@@ -1412,4 +1413,12 @@ int td_ioctl_raid_get_conf(struct td_raid *dev,
 
 error:
 	return rc;
+}
+
+int td_ioctl_raid_resync(struct td_raid *rdev)
+{
+	if (!rdev->ops->_resync)
+		return -EINVAL;
+
+	return rdev->ops->_resync(rdev);
 }

@@ -80,8 +80,11 @@ static int td_token_dev_to_virt(struct td_token *tok,
 	struct td_engine *eng = td_token_engine(tok);
 	char *dst = (char*)tok->host_buf_virt;
 	const char *src = (char*)dev_data_src;
+	const char *alias = (char*)dev_data_alias;
 	uint data_len = tok->len_dev_to_host;
+	int rc;
 
+#if 0
 	if (TD_MAPPER_TYPE_TEST(READ_DATA, WC)) {
 		td_memcpy_movntdqa_64(dst, src, data_len);
 
@@ -93,11 +96,122 @@ static int td_token_dev_to_virt(struct td_token *tok,
 	} else {
 		memcpy(dst, src, data_len);
 	}
+#else
+	int use_read_aliases;
+	char *cache;
+
+	use_read_aliases = td_eng_conf_var_get(eng, USE_READ_ALIASES);
+	cache = eng->td_read_data_cache + (PAGE_SIZE * tok->rd_bufid);
+	if (use_read_aliases >= 2 && !eng->td_read_data_cache)
+		use_read_aliases = 1;
+
+
+		if (!TD_MAPPER_TYPE_TEST(READ_DATA, WB)) {
+			/* optimized read fro WC/UC mapping */
+			switch (use_read_aliases) {
+			default:
+				/* copy from source to dest */
+				td_memcpy_movntdqa_64(dst, src, data_len);
+				break;
+			case 1:
+				/* read source and alias, if equal write to
+				 * dest, otherwise fail */
+				rc = td_memcpy_movntdqa_64_alias_compare(
+						dst, src, alias, data_len);
+				if (rc<0)
+					goto bail;
+				break;
+			case 2:
+				/* read from source and cache, if different
+				 * read from alias, write to destination */
+				td_memcpy_movntdqa_64_cached_alias_compare(
+						dst, src, cache, alias, data_len);
+				break;
+			case 3:
+				/* read from source and cache, if different
+				 * read from alias, if alias differs from
+				 * source fail, otherwise write to dest */
+				rc = td_memcpy_movntdqa_64_cached_alias_compare_test(
+						dst, src, cache, alias, data_len);
+				td_eng_trace(eng, TR_TOKEN, "DI:dev2bio:compare", rc);
+				switch(rc) {
+				case 0:
+					break;
+				case 1:
+					td_eng_counter_token_inc(eng, RDBUF_ALIAS_DUPLICATE);
+					break;
+				case -1:
+					td_eng_counter_token_inc(eng, RDBUF_ALIAS_CORRECTION);
+					break;
+				}
+				break;
+			}
+		} else {
+			/* cached read fom WB mapping */
+			switch (use_read_aliases) {
+			default:
+				if (td_cache_flush_exact_test(eng,PRE,NTF,RDBUF)) {
+					/* cached mapping; read buffer was already filled
+					* with the fill word with NT-writes */
+					void const * const src_alias[2] = {src, alias};
+					if (0) td_eng_info(eng, "D2B: WB[%d] %s\n", use_read_aliases, "td_memcpy_8x8_movq_bad_clflush");
+					td_memcpy_8x8_movq_bad_clflush(dst, src_alias,
+							data_len, TERADIMM_NTF_FILL_WORD);
+				} else {
+					/* cached mapping; builtin memcpy */
+					memcpy(dst, src, data_len);
+				}
+				break;
+			case 1:
+				/* read source and alias, if equal write to
+				 * dest, otherwise fail */
+				if (0) td_eng_info(eng, "D2B: WB[%d] %s\n", use_read_aliases, "td_memcpy_alias_compare");
+				rc = td_memcpy_alias_compare(
+						dst, src, alias, data_len);
+				if (rc<0)
+					goto bail;
+				break;
+			case 2:
+				/* read from source and cache, if different
+				 * read from alias, write to destination */
+				if (0) td_eng_info(eng, "D2B: WB[%d] %s\n", use_read_aliases, "td_memcpy_cached_alias_compare");
+				td_memcpy_cached_alias_compare(
+						dst, src, cache, alias, data_len);
+				break;
+			case 3:
+				/* Need a block for our src_alias */
+				do {
+					/* read from source and cache, if different
+					 * read from alias, if alias differs from
+					 * source, track */
+					void const * const src_alias[2] = {src, alias};
+
+					if (0) td_eng_info(eng, "D2B: WB[%d] %s\n", use_read_aliases, "td_memcpy_cached_alias_compare_test");
+					td_eng_trace(eng, TR_DI, "DI:compare_test:tok", tok->tokid);
+					rc = td_memcpy_cached_alias_compare_test(dst, src_alias, cache, data_len);
+					if (0) td_eng_info(eng, "  - rc %d [%016llx]\n", rc, *(uint64_t*)cache);
+					switch(rc) {
+					case 0:
+						break;
+					case 1:
+						td_eng_counter_token_inc(eng, RDBUF_ALIAS_DUPLICATE);
+						break;
+					case -1:
+						td_eng_counter_token_inc(eng, RDBUF_ALIAS_CORRECTION);
+						break;
+					}
+				} while (0);
+				break;
+			}
+		}
+#endif
 
 	td_eng_trace(eng, TR_TOKEN, "dev_to_virt:bufvirt[0] ",
 			((uint64_t*)dst)[0]);
 
-	return data_len;
+	rc = data_len;
+bail:
+	return rc;
 }
 
 /**

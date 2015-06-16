@@ -106,6 +106,12 @@ typedef struct picVersionInfo
 #define PIC_VERFLAG_MISMATCH_CAUSE_UNKNOWN  4
 #define PIC_VERFLAG_OFFLINE_UPGRADE_REQUIRED 8
 
+// Flags indicated in mRushFwVerFlags
+#define RUSH_VERFLAG_NO_ERROR           0
+#define RUSH_VERFLAG_BANK_MISMATCH      1
+#define RUSH_VERFLAG_VERSION_MISMATCH   2
+#define RUSH_VERFLAG_VERSION_UNKNOWN    4
+
 #define MONET_ID_SIZE 8
 
 typedef struct td_param_page0_monet_map {
@@ -137,6 +143,9 @@ typedef struct td_param_page0_monet_map {
 #define CAPEX_0_POWER_LIMIT     14
 #define CAPEX_0_HOST_IRQ        15
 #define CAPEX_0_RAID_PAGE       16
+#define CAPEX_0_OEM_VPD_READ    17
+#define CAPEX_0_OEM_VPD_WRITE   18
+#define CAPEX_0_TRIM            19
 
 
 #define CAPEX_FLAG(_word, _bit)   (1 << CAPEX_ ## _word ## _ ## _bit )
@@ -356,12 +365,16 @@ struct td_param_page0_map_162 {
 	union td_param mRsvdCoreBuffMask3; // 111
 	union td_param mRsvdCoreBuffMask4; // 112
 	picVersionInfo_t mPicVerInfo; // 113
-	union td_param Reserved_2[14]; // 114
+	union td_param mRushFwVerFlags; // 114
+	union td_param Reserved_2[13]; // 115
 };
 
+#define TD_PARAM_PAGE_1_MAGIC_1 0x53455450
+#define TD_PARAM_PAGE_1_MAGIC_2 0x4152414d
+
 struct td_param_page1_map {
-	union td_param magic_1;
-	union td_param magic_2;
+	union td_param magic_1; // set to 0x53455450
+	union td_param magic_2; // set to 0x4152414d
 	union td_param fw_interrupt_threshold;
 	union td_param fw_interrupt_timeout;
 	union td_param fw_temp_poll_rate;

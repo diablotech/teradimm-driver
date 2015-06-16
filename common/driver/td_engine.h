@@ -73,16 +73,18 @@
 #include "td_stash.h"
 #include "td_monitor.h"
 #include "td_worker.h"
+#include "td_bitmap.h"
+#include "td_histogram.h"
+
+#include "td_bio.h"
+
+#include "td_engine_def.h"
+
 
 #ifdef CONFIG_PM
 #include <linux/pm.h>
 #endif
 
-#include "td_bio.h"
-#include "td_bitmap.h"
-#include "td_histogram.h"
-
-#include "td_engine_def.h"
 
 struct request_queue;
 struct td_ioctl_device_lock;
@@ -152,6 +154,9 @@ extern int td_engine_start_bio(struct td_engine *eng);
 
 extern int td_engine_queue_bio(struct td_engine *eng, td_bio_ref bio);
 
+extern int td_engine_block_bio_range (struct td_engine *eng, uint64_t start, uint64_t end, int queued);
+extern int td_engine_unblock_bio_range (struct td_engine *eng);
+
 #if CONFIG_TERADIMM_INCOMING_BACKPRESSURE == TD_BACKPRESSURE_EVENT
 static inline void td_eng_account_bio_completion(struct td_engine *eng)
 {
@@ -201,6 +206,31 @@ static inline void td_eng_account_bio_completion(struct td_engine *eng)
 #define td_eng_account_bio_completion(_eng) do { } while (0)
 #endif
 
+static inline void td_eng_endio (struct td_engine *eng, td_bio_ref bio,
+		int result, cycles_t ts)
+{
+	td_eng_trace(eng, TR_BIO, "BIO:end:bio   ", (uint64_t)bio);
+	/* update the counter */
+	eng->td_total_bios++;
+	
+	/* if incoming requests are waiting, release them */
+	td_eng_account_bio_completion(eng);
+
+	/* update the request latency */
+	if (td_bio_is_write(bio))
+		td_eng_latency_end(&eng->td_bio_latency, bio,
+				"req-wr-latency",
+				(struct td_io_latency_counters *)&eng->counters.write[TD_DEV_GEN_COUNT_REQ_LAT]);
+	else
+		td_eng_latency_end(&eng->td_bio_latency, bio,
+				"req-rd-latency",
+				(struct td_io_latency_counters *)&eng->counters.read[TD_DEV_GEN_COUNT_REQ_LAT]);
+
+	td_bio_endio(eng, bio, result, ts);
+	td_eng_trace(eng, TR_BIO, "BIO:end:result", result);
+}
+
+#if 0
 static inline void td_engine_endio(struct td_engine *eng, td_bio_ref bio, int result)
 {
 #ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
@@ -213,6 +243,9 @@ static inline void td_engine_endio(struct td_engine *eng, td_bio_ref bio, int re
 
 		return;
 	}
+#endif
+#ifdef CONFIG_TERADIMM_BIO_FTRACE
+	trace_printk("TD %s engine endio %d\n", td_eng_name(eng), result);
 #endif
 	if (unlikely(result)) {
 		/*
@@ -227,6 +260,7 @@ static inline void td_engine_endio(struct td_engine *eng, td_bio_ref bio, int re
 	/* if incoming requests are waiting, release them */
 	td_eng_account_bio_completion(eng);
 }
+#endif
 
 extern void __td_terminate_all_outstanding_bios(struct td_engine *eng, int reset_active_tokens, int result);
 
@@ -236,18 +270,20 @@ static inline void td_terminate_all_outstanding_bios(struct td_engine *eng,
 	__td_terminate_all_outstanding_bios(eng, reset_active_tokens, -EIO);
 }
 
+/* poke the device group / worker threads and force them to stay up for a while */
 static inline void td_engine_poke (struct td_engine *eng)
 {
 	td_device_poke(td_engine_device(eng));
 }
 
+/* only poke the worker threads if required */
 static inline void td_engine_sometimes_poke (struct td_engine *eng)
 {
 	struct td_device *dev = td_engine_device(eng);
 	struct td_devgroup *dg = td_engine_devgroup(eng);
 
-	if (td_work_item_needs_poke(dev->td_work_item, td_dg_conf_worker_var_get(dg, DEV_IDLE_JIFFIES)))
-		td_devgroup_poke(dg);
+	(void)td_work_item_poke(&dg->dg_work_node,
+			dev->td_work_item);
 }
 
 
@@ -299,6 +335,10 @@ struct td_command_generator {
 
 	int (*_ata)(uint64_t bytes[8], uint8_t*atacmd, int ssd, int data_size);
 
+	int (*_bio_read4k)(uint64_t bytes[8], uint8_t ssd, uint64_t lba, uint16_t core_buf, uint8_t needs_meta);
+
+	int (*_bio_write4k)(uint64_t bytes[8], uint8_t ssd, uint64_t lba, uint16_t core_buf, uint8_t needs_meta, uint16_t wep);
+
 	int (*_get_reg)(uint64_t bytes[8], uint32_t reg);
 	int (*_put_reg)(uint64_t bytes[8], uint32_t reg, uint32_t data, uint32_t mask);
 
@@ -316,6 +356,7 @@ struct td_command_generator {
 	(eng->ops->_generator->_ ## cmd ? \
 		 eng->ops->_generator->_ ## cmd (__VA_ARGS__) : \
 		 -EINVAL)
+
 /*
  * the #define below checks if the _generator has a function pointer to
  * "_cmd", if the pointer exists, the function is then called with "bytes" and,
@@ -450,25 +491,20 @@ static inline void td_token_assign_lba_and_offset_from_bio(struct td_token *tok,
 		uint64_t piece = lba / stride;
 		uint64_t offset = lba % stride;
 
-#ifdef CONFIG_TERADIMM_FORCE_SSD_HACK
-		extern int force_ssd;
-		if (unlikely(force_ssd >= 0)) {
-			uint64_t ssd_sec_cnt = td_eng_conf_hw_var_get(eng, SSD_SECTOR_COUNT);
-			tok->port = force_ssd;
-			tok->to_ssd = 1;
-			tok->lba = lba % ssd_sec_cnt;
-			tok->lba_ofs = (uint16_t)lba_ofs;
-			return;
-		}
-#endif
-
 		tok->to_ssd = 1;
 		tok->port = (uint16_t)(piece % td_eng_conf_hw_var_get(eng, SSD_COUNT));
 		tok->lba = stride * (piece / td_eng_conf_hw_var_get(eng, SSD_COUNT)) + offset;
 		tok->lba_ofs = (uint16_t)lba_ofs;
+
 	} else {
+#ifdef CONFIG_TERADIMM_FORCE_SSD_HACK
+		extern int force_ssd;
+		if (unlikely(force_ssd >= 0) )
+			tok->port = force_ssd;
+#endif
 		tok->lba     = td_bio_lba(eng, bio);
 		tok->lba_ofs = (uint16_t)td_bio_lba_offset(eng, bio);
+
 	}
 }
 
@@ -917,7 +953,7 @@ static inline unsigned td_early_completed_reads(struct td_engine *eng)
 
 static inline unsigned td_noupdate_tokens(struct td_engine *eng)
 {
-	return eng->td_counters.token.noupdate_cnt;
+	return td_eng_counter_token_get(eng, NOUPDATE_CNT);
 }
 
 #ifdef CONFIG_TERADIMM_RUSH_INGRESS_PIPE
@@ -930,7 +966,7 @@ static inline uint64_t td_noupdate_headroom(struct td_engine *eng)
 	if (!limit)
 		return TD_TOKENS_PER_DEV;
 
-	count = eng->td_counters.token.noupdate_cnt;
+	count = td_eng_counter_token_get(eng, NOUPDATE_CNT);
 
 	return (limit > count) ? (limit - count) : 0;
 }
@@ -949,11 +985,12 @@ static inline void td_token_awaits_update(struct td_engine *eng,
 
 	__set_bit(tok->tokid, map);
 
-	count = eng->td_counters.token.noupdate_cnt ++;
+	td_eng_counter_token_inc(eng, NOUPDATE_CNT);
+	count = td_eng_counter_token_get(eng, NOUPDATE_CNT);
 
 	limit = td_eng_conf_var_get(eng, NOUPDATE_CMD_LIMIT);
 	if (limit && count >= limit) 
-		eng->td_counters.token.noupdate_limit_reached ++;
+		td_eng_counter_token_inc(eng, NOUPDATE_LIMIT_REACHED);
 #endif
 }
 
@@ -968,7 +1005,7 @@ static inline void td_token_received_update(struct td_engine *eng,
 		return;
 
 	__clear_bit(tok->tokid, map);
-	eng->td_counters.token.noupdate_cnt --;
+	td_eng_counter_token_dec(eng, NOUPDATE_CNT);
 #endif
 }
 
@@ -2251,6 +2288,12 @@ static inline int td_can_start_work_now(struct td_engine *eng)
 	return 0;
 }
 
+static inline uint64_t td_engine_lbas(struct td_engine *eng)
+{
+	return (td_eng_conf_hw_var_get(eng, SSD_SECTOR_COUNT) 
+			& ~(td_eng_conf_hw_var_get(eng, SSD_STRIPE_LBAS)-1))
+		* td_eng_conf_hw_var_get(eng, SSD_COUNT);
+}
 
 static inline uint64_t td_engine_capacity(struct td_engine* eng)
 {
@@ -2261,8 +2304,7 @@ static inline uint64_t td_engine_capacity(struct td_engine* eng)
 	 * and where they start on the next device.
 	 */
 	return td_eng_conf_hw_var_get(eng, HW_SECTOR_SIZE)
-		* (td_eng_conf_hw_var_get(eng, SSD_SECTOR_COUNT) & ~(td_eng_conf_hw_var_get(eng, SSD_STRIPE_LBAS)-1))
-		* td_eng_conf_hw_var_get(eng, SSD_COUNT);
+		* td_engine_lbas(eng);
 }
 
 /*
@@ -2284,9 +2326,10 @@ int __td_eng_run_thread_work (struct td_engine *eng, struct td_eng_thread_work *
 
 static inline int td_eng_thread_work(struct td_engine* eng, struct td_eng_thread_work* work)
 {
+#if 0
 	/* We need to be locked, to make sure everything stays around */
 	WARN_TD_DEVICE_UNLOCKED(td_engine_device(eng));
-
+#endif
 	BUG_ON(!td_engine_devgroup(eng));
 	
 	return __td_eng_run_thread_work(eng, work);

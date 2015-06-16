@@ -102,6 +102,11 @@ struct td_corebuf {
 };
 #endif
 
+struct td_engine_range {
+	uint64_t start;
+	uint64_t end;
+};
+
 /**
  * tracks the state of a hardware engine
  */
@@ -130,9 +135,8 @@ struct td_engine {
 	/* For our thread_work API */
 	td_atomic_ptr_t         td_thread_work;
 
-	/** counters ready for export via IOCTL */
+	/** statistics ready for export via IOCTL */
 	struct td_ioctl_device_stats td_stats;
-	struct td_ioctl_device_counters_internal td_counters;
 
 	/* structures to help track latencies */
 	struct td_eng_latency   td_bio_latency;
@@ -381,6 +385,7 @@ struct td_engine {
 	unsigned                td_last_was_write:1;
 
 	struct td_eng_conf      conf;
+	struct td_eng_counters  counters;
 	/* Used for power management. */
 	uint8_t pm_power_cycle;
 
@@ -413,7 +418,21 @@ struct td_engine {
 	mempool_t               *work_pool;
 #endif
 
+	void * td_read_data_cache;
+	void * td_read_meta_cache;
+
 	struct td_ecc_bins ecc_bins;
+	
+	struct  {
+
+		struct td_engine_range range;
+#ifdef CONFIG_DEBUG_BIO_LOCKS
+		void     *debug_bio;
+#endif
+		struct {
+			uint64_t        active:1;
+		} flags;
+	} bio_block;
 
 #ifdef CONFIG_TERADIMM_MCEFREE_FWSTATUS
 	struct {

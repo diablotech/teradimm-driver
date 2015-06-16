@@ -71,7 +71,7 @@
 #include "td_ucmd.h"
 #include "td_memspace.h"
 #include "td_params.h"
-#include "td_biogrp.h"
+#include "td_bio.h"
 #include "td_eng_mcefree.h"
 
 #ifdef CONFIG_TERADIMM_SGIO
@@ -86,11 +86,23 @@ MODULE_PARAM(uint, start_seq, 0)
 
 MODULE_PARAM(uint, td_ntf_enable, 1)
 MODULE_PARAM(uint, td_mcefree_enable, 1)
+MODULE_PARAM(uint, td_default_use_read_aliases, 3)
 
 #ifdef CONFIG_TERADIMM_MCEFREE_FWSTATUS
 #ifdef CONFIG_TERADIMM_DIRECT_STATUS_ACCESS
 #warning FCEFREE_FWSTATUS is not compatible with DIRECT_STATUS_ACCESS
 #endif
+#endif
+
+#ifdef CONFIG_TERADIMM_FORCE_SSD_HACK
+int force_ssd = -1;
+module_param_named(force_ssd, force_ssd, int, 0644);
+
+MODULE_PARAM(uint, SSD_sector_count, 50*1024*1024*2)
+MODULE_PARAM(uint, SSD_sector_size,  512)
+
+module_param_named(ssd_sector_size,  SSD_sector_size , uint, 0644);
+module_param_named(ssd_sector_count, SSD_sector_count, uint, 0644);
 #endif
 
 
@@ -109,6 +121,9 @@ MODULE_PARM_DESC(ntf, "Enable NTF flushing mode.");
 
 module_param_named(mcefree, td_mcefree_enable, uint, 0444);
 MODULE_PARM_DESC(mcefree, "Enable mcefree mode.");
+
+module_param_named(use_read_aliases, td_default_use_read_aliases, uint, 0644);
+MODULE_PARM_DESC(use_read_aliases, "Default USE_READ_ALIASES for new devices");
 
 /* this is a HACK, remove later */
 module_param(start_seq, uint, 0444);
@@ -495,6 +510,9 @@ void teradimm_assign_default_config(struct td_engine *eng)
 	td_eng_conf_var_set(eng, HOLD_TIMEDOUT_TOKENS, 1); /* TeraDIMM puts timedout tokens on a hold list */
 	td_eng_conf_var_set(eng, TIMEDOUT_CNT_THRESHOLD, 128); /* Give up once we hit this many timedout tokens */
 
+
+	td_eng_conf_var_set(eng, USE_READ_ALIASES, td_default_use_read_aliases); /* vmware: enable read aliases, they are needed for WB mapping */
+
 	if (td_engine_device(eng)->td_memspeed < 933) {
 		/* We have to limit HOST_WRITE_BUFS to 1 because this might be
 		 * 800Mhz */
@@ -662,6 +680,18 @@ static void teradimm_dump_params (void* param_page, int page)
 #endif
 
 
+#ifdef CONFIG_TERADIMM_FORCE_SSD_HACK
+void teradimm_fake_ssd_conf (struct td_engine *eng)
+{
+	td_eng_conf_hw_var_set(eng, HW_SECTOR_ALIGN, 0);
+	td_eng_conf_hw_var_set(eng, HW_SECTOR_SIZE, SSD_sector_size);
+	td_eng_conf_hw_var_set(eng, SSD_SECTOR_COUNT, SSD_sector_count);
+
+	td_eng_conf_hw_var_set(eng, SSD_COUNT, 1);
+}
+#endif
+
+
 int teradimm_config_engine_hw_conf_160 (struct td_engine *eng,
 	      union td_param *params)
 {
@@ -673,13 +703,11 @@ int teradimm_config_engine_hw_conf_160 (struct td_engine *eng,
 	uint64_t ssd_count;
 	int i;
 
-#ifdef CONFIG_TERADIMM_IGNORE_SSD
-	td_eng_conf_hw_var_set(eng, HW_SECTOR_SIZE, 512);
-	td_eng_conf_hw_var_set(eng, HW_SECTOR_ALIGN, 0);
-	td_eng_conf_hw_var_set(eng, SSD_COUNT, 2);
-	td_eng_conf_hw_var_set(eng, SSD_SECTOR_COUNT, 1024*1024);
-
-	return 0;
+#ifdef CONFIG_TERADIMM_FORCE_SSD_HACK
+	if (force_ssd != -1) {
+		teradimm_fake_ssd_conf(eng);
+		return 0;
+	}
 #endif
 
 	ssd_count = p->ssd_total.u32;    /* SSDs total */
@@ -733,13 +761,11 @@ int teradimm_config_engine_hw_conf_161 (struct td_engine *eng,
 	uint64_t ssd_count;
 	int i;
 
-#ifdef CONFIG_TERADIMM_IGNORE_SSD
-	td_eng_conf_hw_var_set(eng, HW_SECTOR_SIZE, 512);
-	td_eng_conf_hw_var_set(eng, HW_SECTOR_ALIGN, 0);
-	td_eng_conf_hw_var_set(eng, SSD_COUNT, 2);
-	td_eng_conf_hw_var_set(eng, SSD_SECTOR_COUNT, 1024*1024);
-
-	return 0;
+#ifdef CONFIG_TERADIMM_FORCE_SSD_HACK
+	if (force_ssd != -1) {
+		teradimm_fake_ssd_conf(eng);
+		return 0;
+	}
 #endif
 
 	ssd_count = p->mSSDTotal.u32;    /* SSDs total */
@@ -884,15 +910,12 @@ int teradimm_config_engine_hw_conf_162 (struct td_engine *eng,
 	}
 
 
-#ifdef CONFIG_TERADIMM_IGNORE_SSD
-	td_eng_conf_hw_var_set(eng, HW_SECTOR_SIZE, 512);
-	td_eng_conf_hw_var_set(eng, HW_SECTOR_ALIGN, 0);
-	td_eng_conf_hw_var_set(eng, SSD_COUNT, 2);
-	td_eng_conf_hw_var_set(eng, SSD_SECTOR_COUNT, 1024*1024);
-
-	return 0;
+#ifdef CONFIG_TERADIMM_FORCE_SSD_HACK
+	if (force_ssd != -1) {
+		teradimm_fake_ssd_conf(eng);
+		return 0;
+	}
 #endif
-
 	ssd_count = p->mSSDTotal.u32;    /* SSDs total */
 
 	lba_count_min = 1ULL << 48;
@@ -944,6 +967,14 @@ int teradimm_config_engine_conf (struct td_engine *eng,
 	struct td_eng_teradimm *td = td_eng_td_hal(eng);
 	uint64_t host_provision;
 	// teradimm_dump_params(param, 1);
+
+	/* check magic values to ensure page is sane */
+	if (param->magic_1.u32 != TD_PARAM_PAGE_1_MAGIC_1 ||
+			param->magic_2.u32 != TD_PARAM_PAGE_1_MAGIC_2) {
+		td_eng_err(eng, "get_params page 1 has unexpected magic values(%u %u)\n",
+				param->magic_1.u32, param->magic_2.u32);
+		return -EINVAL;
+	}
 
 	td_eng_conf_hw_var_set(eng, BIO_SECTOR_SIZE, param->host_blocksize.value);
 	td_eng_conf_hw_var_set(eng, E2E_MODE, param->host_e2e_mode.value);
@@ -1027,7 +1058,8 @@ error_skip_reserve:
 }
 
 #define WARN_ON_TOK_FAILED(tok) do { \
-	if (tok->result != TD_TOK_RESULT_OK) { \
+	if (tok->result != TD_TOK_RESULT_OK \
+			&& !tok->quick_n_quiet) { \
 		td_eng_warn((tok)->td_engine, \
 			"%s:%u: tok %u cmd %016llx result %d\n", \
 			__FUNCTION__, __LINE__, (tok)->tokid, \
@@ -1187,7 +1219,7 @@ static struct td_token* teradimm_hw_init_cancel (struct td_engine *eng)
 {
 	struct td_token *maint_tok;
 	struct td_eng_teradimm *td = td_eng_td_hal(eng);
-	teradimm_global_status_t gstatus;
+	teradimm_global_status_t gstatus = { 0 };
 
 	td_eng_hal_read_ext_status(eng, TERADIMM_EXT_STATUS_GLOBAL_IDX, &gstatus, 1);
 	if (gstatus.fw & 0x80) {
@@ -1721,6 +1753,8 @@ static void teradimm_hw_init_mcefree_configure(struct td_engine *eng)
 	td_eng_conf_mcefree_var_set(eng, STATUS_R2P_DROP_NSEC,     10); /*< decreases hold time by this much */
 	td_eng_conf_mcefree_var_set(eng, STATUS_R2P_COOL_MSEC,     40); /*< start dropping after this time */
 
+	td_eng_conf_mcefree_var_set(eng, STATUS_REQ_FLUSH,          1); /*< flush fwstatus request command */
+	td_eng_conf_mcefree_var_set(eng, RDMETA_FLUSH,              0); /*< don't flush rdbuf-meta before reading */
 #endif
 }
 
@@ -2034,6 +2068,56 @@ dead:
 	return -EIO;
 }
 
+/* there are 32 read buffers in HW that we should first allocate for MCEFREE.
+ * this will allow us to control their availability through further
+ * deallocations while requiring the HW to queue. */
+#define TD_HW_INIT_MCEFREE_DEALLOC_STEPS 32
+
+static struct td_token* teradimm_hw_init_mcefree_dealloc_setup(struct td_engine *eng)
+{
+	struct td_eng_teradimm *td = td_eng_td_hal(eng);
+	struct td_token *tok;
+
+	if (td->hw_init.slot == 0)
+		td_eng_info(eng, "Running MCEFREE deallocation setup\n");
+
+	/* allocate a command token with intent to read */
+	tok = td_alloc_token_with_host_page(eng, TD_TOK_FOR_FW, 0, PAGE_SIZE);
+	if (!tok)
+		goto error_alloc_token;
+
+	td_eng_trace(eng, TR_FW, "hw-init:mcefree_dealloc_setup:tok", tok->tokid);
+	td_eng_trace(eng, TR_FW, "hw-init:mcefree_dealloc_setup:slot", td->hw_init.slot);
+
+	// td_cmdgen_get_params
+	td_eng_cmdgen(eng, get_params, tok->cmd_bytes, 0 /* arbitrary page */);
+	
+	teradimm_finalize_tok_cmd_with_buffers(tok);
+
+	return tok;
+
+error_alloc_token:
+	td_eng_err(eng, "Failed start MCEFREE deallocation setup.\n");
+	return NULL;
+}
+
+static int teradimm_hw_init_mcefree_dealloc_setup_done(struct td_token *tok)
+{
+	struct td_engine *eng = td_token_engine(tok);
+	struct td_eng_teradimm *td = td_eng_td_hal(eng);
+
+	WARN_ON_TOK_FAILED(tok);
+
+	td_eng_trace(eng, TR_FW, "hw_init:mcefree_dealloc_setup:done", tok->tokid);
+	td_eng_trace(eng, TR_FW, "hw_init:mcefree_dealloc_setup:result", tok->result);
+
+	td->hw_init.slot++;
+	if (td->hw_init.slot < TD_HW_INIT_MCEFREE_DEALLOC_STEPS)
+		return 0;
+
+	return 1;
+}
+
 struct hw_init_steps {
 	struct td_token * (*prep)(struct td_engine*);
 	int (*hook)(struct td_token*);
@@ -2057,6 +2141,7 @@ static struct hw_init_steps steps[] =
 	HW_INIT_STEP(deallocate)
 #ifdef CONFIG_TERADIMM_MCEFREE_FWSTATUS
 	HW_INIT_STEP(mcefree_hold_rdbuf0)
+	HW_INIT_STEP(mcefree_dealloc_setup)
 #endif
 	HW_INIT_STEP(sata)
 	HW_INIT_STEP(poll)
@@ -2422,7 +2507,11 @@ int teradimm_ops_online(struct td_engine *eng)
 		goto error;
 	}
 
-	teradimm_config_engine_conf(eng, ucmd->data_virt);
+	rc = teradimm_config_engine_conf(eng, ucmd->data_virt);
+	if (rc) {
+		td_eng_err(eng, "Could not configure engine with params page 1 data, rc = %d\n", rc);
+		goto error;
+	}
 
 	rc = -EMEDIUMTYPE;
 	conf_value = td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE);
@@ -2660,7 +2749,7 @@ static void mcefree_fwstatus_sema_error_occured(struct td_engine *eng)
 {
 	uint64_t val, max;
 
-	eng->td_counters.misc.fwstatus_sema_misses_cnt ++;
+	td_eng_counter_misc_inc(eng, FWSTATUS_SEMA_MISSES_CNT);
 	eng->td_last_fwstatus_sema_error = td_get_cycles();
 
 	/* current value */
@@ -2817,6 +2906,14 @@ static int teradimm_mcefree_send_request(struct td_engine *eng)
 		alias = 0;
 		hw_cmd_buf = teradimm_map_cmd_buf(td->td_mapper, alias, tok->tokid);
 		td_memcpy_8x8_movnti(hw_cmd_buf, tok->cmd_bytes, TERADIMM_COMMAND_SIZE);
+
+		if (td_eng_conf_mcefree_var_get(eng, STATUS_REQ_FLUSH)) {
+			uint64_t v;
+			/* uncached read from a WC region forces write back
+			 * of the dirty cachelines in the WC buffer */
+			v = *(volatile uint64_t*)hw_cmd_buf;
+			(void)v;
+		}
 	}
 
 	td->mcefree.last_updates_completed = 0;
@@ -3036,7 +3133,7 @@ EI_skip_poll:
 			/* we have been reading the semaphore for STATUS_R2P_TIMEOUT_USEC
 			 * and didn't observe a flip.  resetting the counters
 			 * below will cause a retry of the GPIO request. */
-			eng->td_counters.misc.fwstatus_sema_timeout_cnt ++;
+			td_eng_counter_misc_inc(eng, FWSTATUS_SEMA_TIMEOUT_CNT);
 
 			if (!td_run_state_check(eng, FW_PROBE)
 					&& td_eng_conf_mcefree_var_get(eng,
@@ -3064,7 +3161,7 @@ EI_skip_poll:
 						"on %u consecutive retry.\n",
 						nsec_r2p/1000, td->mcefree.count_retries);
 
-				eng->td_counters.misc.fwstatus_sema_timeout_max_cnt ++;
+				td_eng_counter_misc_inc(eng, FWSTATUS_SEMA_TIMEOUT_MAX_CNT);
 
 #ifdef CONFIG_TERADIMM_TOKEN_HISTORY
 				td_tok_event(td->mcefree.last_gpio_tok, TD_TOK_EVENT_END,
@@ -3095,7 +3192,7 @@ EI_skip_poll:
 
 	if (!td->mcefree.count_retries)
 		mcefree_fwstatus_sema_successfully_read(eng);
-	eng->td_counters.misc.fwstatus_sema_success_cnt ++;
+	td_eng_counter_misc_inc(eng, FWSTATUS_SEMA_SUCCESS_CNT);
 
 	eng->td_last_fwstatus_request_posted = 0;
 	td->mcefree.last_updates_completed = td_get_cycles();
@@ -4270,7 +4367,8 @@ static int teradimm_ops_read_page(struct td_engine *eng,
 	int accumulated;
 	int flush_size;
 	void * hw_data_buf, * hw_meta_buf;
-	void * hw_data_alias, * hw_meta_alias;
+	void * hw_data_alias = NULL, * hw_meta_alias = NULL;
+	void * cache_data = NULL, * cache_meta = NULL;
 
 	td_eng_trace(eng, TR_TOKEN, "TD:read_page:tok        ", tok->tokid);
 	td_eng_trace(eng, TR_TOKEN, "TD:read_page:LBA        ", tok->lba);
@@ -4315,8 +4413,24 @@ static int teradimm_ops_read_page(struct td_engine *eng,
 	hw_data_buf = teradimm_map_read_data_buf(td->td_mapper, 0, tok->rd_bufid);
 	hw_meta_buf = teradimm_map_read_meta_buf(td->td_mapper, 0, tok->rd_bufid);
 
-	hw_data_alias = teradimm_map_read_data_buf(td->td_mapper, 1, tok->rd_bufid);
-	hw_meta_alias = teradimm_map_read_meta_buf(td->td_mapper, 1, tok->rd_bufid);
+	switch (td_eng_conf_var_get(eng, USE_READ_ALIASES)) {
+	case 3: /* 2 and 3 need the cache as well as the aliases */
+	case 2:
+		cache_data = eng->td_read_data_cache + (TERADIMM_DATA_BUF_SIZE * tok->rd_bufid);
+		cache_meta = eng->td_read_meta_cache + (TERADIMM_META_BUF_SIZE * tok->rd_bufid);
+		/* Fall through, these need the aliases */
+	case 1:
+		hw_data_alias = teradimm_map_read_data_buf(td->td_mapper, 1, tok->rd_bufid);
+		hw_meta_alias = teradimm_map_read_meta_buf(td->td_mapper, 1, tok->rd_bufid);
+		break;
+	default:
+		/* We need the alias only IFF using NTF flush on WB */
+		if (TD_MAPPER_TYPE_TEST(READ_DATA, WB) &&
+				td_cache_flush_exact_test(eng,PRE,NTF,RDBUF)) {
+			hw_data_alias = teradimm_map_read_data_buf(td->td_mapper, 1, tok->rd_bufid);
+			hw_meta_alias = teradimm_map_read_meta_buf(td->td_mapper, 1, tok->rd_bufid);
+		}
+	}
 
 	/* pre flush */
 
@@ -4328,29 +4442,18 @@ static int teradimm_ops_read_page(struct td_engine *eng,
 		/* A BIO copy can possibly request less than all the
 		 * data.  So we can try an doptimize for less than that
 		 */
-		if (likely(tok->host.bio))
+		if (likely(tok->host.bio)) {
 			bytes = td_bio_get_byte_size(tok->host.bio);
 
-		if (bytes < TERADIMM_DATA_BUF_SIZE) {
-			/*
-			 * If we're using METADATA on the device, we need to
-			 * include it in our flushing
-			 */
 			if (td_eng_conf_hw_var_get(eng, HW_SECTOR_METADATA) )
-				bytes += (bytes/512 * 8);
+				bytes += (bytes/512) * 8;
+		}
 
-			flush_size = min_t(unsigned, bytes,
-					TERADIMM_DATA_BUF_SIZE);
-			td_cache_flush(eng, PRE, RDBUF, hw_data_buf, flush_size);
-
-			flush_size = min_t(unsigned, bytes - flush_size,
-					TERADIMM_META_BUF_SIZE);
-			if (flush_size)
-				td_cache_flush(eng, PRE, RDBUF, hw_meta_buf, flush_size);
-
+		if (bytes > TERADIMM_DATA_BUF_SIZE) {
+			td_rdbuf_flush(eng, PRE, hw_data_buf, TERADIMM_DATA_BUF_SIZE, cache_data);
+			td_rdbuf_flush(eng, PRE, hw_meta_buf, TERADIMM_META_BUF_SIZE, cache_meta);
 		} else {
-			td_cache_flush(eng, PRE, RDBUF, hw_data_buf, TERADIMM_DATA_BUF_SIZE);
-			td_cache_flush(eng, PRE, RDBUF, hw_meta_buf, TERADIMM_META_BUF_SIZE);
+			td_rdbuf_flush(eng, PRE, hw_data_buf, TERADIMM_DATA_BUF_SIZE, cache_data);
 		}
 	}
 	}
@@ -4387,7 +4490,8 @@ static inline int teradimm_ops_read_rdbuf_metadata(struct td_engine *eng,
 		unsigned rdbuf, unsigned off, void *out, unsigned len)
 {
 	struct td_eng_teradimm *td = td_eng_td_hal(eng);
-	const void * hw_meta_buf, *src;
+	void * hw_meta_buf, *src;
+	uint64_t v;
 	uint alias;
 
 	if (unlikely (off > TERADIMM_META_BUF_SIZE))
@@ -4400,15 +4504,31 @@ static inline int teradimm_ops_read_rdbuf_metadata(struct td_engine *eng,
 
 	src = PTR_OFS(hw_meta_buf, off);
 
-	if (TD_MAPPER_TYPE_TEST(READ_META_DATA, WB)) {
+	if (TD_MAPPER_TYPE_TEST(READ_META_DATA, WB))
 		clflush_cache_range(src, len);
-		memcpy(out, src, len);
-	} else {
-		if (unlikely(len&63ULL))
-			return -EINVAL;
+
+	if (TD_MAPPER_TYPE_TEST(READ_META_DATA, WC)
+			&& likely((len&63ULL) == 0)) {
+
+		switch (td_eng_conf_mcefree_var_get(eng, RDMETA_FLUSH)) {
+		case 1:
+			mb();
+			clflush(hw_meta_buf);
+			mb();
+			break;
+		case 2:
+			v = *(volatile uint64_t*)hw_meta_buf;
+			(void)v;
+			break;
+		default:
+			break;
+		}
 
 		td_memcpy_movntdqa_64(out, src, len);
+		return 0;
 	}
+
+	memcpy(out, src, len);
 
 	return 0;
 }
@@ -4475,6 +4595,7 @@ int teradimm_ops_filter(struct td_engine *eng, uint64_t bytes[8])
 	case TD_CMD_RD_SEQ:
 	case TD_CMD_WR_DLY:
 	case TD_CMD_WR_FINAL:
+	case TD_CMD_RD_PAGE:
 	case TD_CMD_RD_EXT:
 	case TD_CMD_WR_EXT:
 	case TD_CMD_TRIM:
@@ -4519,7 +4640,6 @@ static int teradimm_ops_trim(struct td_engine *eng,
 {
 	uint64_t size = td_bio_get_byte_size(tok->host.bio);
 	uint64_t *page = (uint64_t*)tok->host.bio->bi_io_vec->bv_page;
-	td_bio_flags_t flags = *td_bio_flags_ref(tok->host.bio);
 	uint64_t value = 0;
 	uint64_t lba = tok->lba;
 	uint64_t count, i;
@@ -4574,10 +4694,7 @@ static int teradimm_ops_trim(struct td_engine *eng,
 		page++;
 	}
 */
-	tok->host.bio->bio_size = 512;
-	/* just because they may have been messed up */
-	*td_bio_flags_ref(tok->host.bio) = flags;
-
+	td_bio_set_byte_size(tok->host.bio, 512);
 
 	teradimm_ops_write_page(eng, tok);
 	return 0;

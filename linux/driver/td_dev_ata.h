@@ -54,11 +54,16 @@
 #define _TD_DEV_ATA_H_
 
 #include "td_kdefn.h"
+#include "td_dev_scsi.h"
 
 #ifdef CONFIG_TERADIMM_SGIO
 #include <scsi/sg.h>
 
-int td_device_block_sgio(struct td_engine *eng, sg_io_hdr_t *hdr);
+int td_dev_ata_ident(struct td_scsi_cmd *cmd);
+int td_dev_ata16_smart(struct td_scsi_cmd *cmd);
+int td_dev_ata16_security(struct td_scsi_cmd *cmd);
+int td_dev_ata16_generic(struct td_scsi_cmd *cmd, 
+		int data_from_device, int data_to_device);
 
 #endif
 #endif

@@ -67,14 +67,13 @@
 #include "td_discovery.h"
 #include "td_dev_ata.h"
 #include "td_memspace.h"
-#include "td_biogrp.h"
+#include "td_bio.h"
+
+#define DEBUG_STRIPE_PRINTK 0
 
 
 /* Per raid type params */
 struct tr_stripe_params {
-	uint32_t                                stride;
-	uint64_t                                dev_lbas;
-	struct td_osdev_block_params		block_params;
 	uint64_t                                conf[TR_CONF_STRIPE_MAX];
 };
 
@@ -83,6 +82,44 @@ static inline struct tr_stripe_params * tr_stripe(struct td_raid *rdev)
 {
 	return (struct tr_stripe_params *) rdev->ops_priv;
 }
+
+#define tr_stripe_var_get(rdev, which)                             \
+	(tr_stripe(rdev)->conf[TR_CONF_STRIPE_##which])
+#define tr_stripe_var_set(rdev, which, val)                            \
+	do { tr_stripe(rdev)->conf[TR_CONF_STRIPE_##which] = val;                   \
+	td_raid_debug(rdev, "CONF STRIPE_%s set to %llu\n", __stringify(which), tr_stripe(rdev)->conf[TR_CONF_STRIPE_##which]); \
+	} while (0)
+
+
+
+static int tr_stripe_part_error (struct td_engine *eng, td_bio_ref bio, 
+		int result, cycles_t ts)
+{
+	struct td_raid *rdev = td_engine_device(eng)->td_raid;
+	struct tr_member *trm;
+	int idx;
+
+	BUG_ON(!rdev);
+
+	if (DEBUG_STRIPE_PRINTK) printk("BIO PART ERROR on %s (%p)\n", td_device_name(td_engine_device(eng)), td_engine_device(eng));
+	/*
+	 * We had an error - 1st thing is to make that engine no longer active
+	 */
+	for (idx = 0; idx < tr_conf_var_get(rdev, MEMBERS); idx++) {
+		trm = rdev->tr_members + idx;
+		if (td_engine_device(eng) == trm->trm_device) {
+			/* Found our index */
+			td_raid_fail_member(rdev, idx);
+			break;
+		}
+		trm = NULL;
+	}
+
+	BUG_ON(!trm);
+
+	return result;
+};
+
 
 
 struct tr_stripe_bio_state {
@@ -97,37 +134,38 @@ struct tr_stripe_bio_state {
 /* --- RAID ops ---*/
 static void tr_stripe_bio (struct td_biogrp *bg, td_bio_ref bio, void *opaque)
 {
+	struct tr_member *trm;
 	struct tr_stripe_bio_state *trbs = opaque;
-	struct td_engine *eng;
-	uint64_t stride;
-	uint64_t devs;
+	uint64_t stride = tr_stripe_var_get(trbs->rdev, DEV_STRIDE);
+	uint64_t devs = tr_conf_var_get(trbs->rdev, MEMBERS);
+	uint64_t sector = td_bio_get_sector_offset(bio);
 
-	/* Ugly hack here */
-	stride = tr_stripe(trbs->rdev)->stride;
-	devs = tr_conf_var_get(trbs->rdev, MEMBERS);
+	uint64_t piece, offset, dev_sector, dev;
 
-	if (0) printk("STRIPE %p %u/%u\n", bio, trbs->bio_count+1, atomic_read(&bg->sr_total));
+	if (DEBUG_STRIPE_PRINTK) printk("STRIPE %p %u/%u\n", bio, trbs->bio_count+1, bg->sr_parts);
 
-	if (1) {
-		uint64_t sector = td_bio_get_sector_offset(bio);
-		uint64_t piece = sector / stride;
-		uint64_t offset = sector % stride;
+	piece = sector / stride;
+	offset = sector % stride;
+	dev_sector = stride * (piece / devs) + offset;
+	dev = piece % devs;
 
-		uint64_t dev_sector = stride * (piece / devs) + offset;
-		uint64_t dev = piece % devs;
+	trm = trbs->rdev->tr_members + dev;
+
+	if (trm->trm_state == TR_MEMBER_ACTIVE) {
+		struct td_engine *eng = td_device_engine(trm->trm_device);
 
 		/* And now we "fix" the sector here... */
-		bio->bi_sector = dev_sector;
+		td_bio_set_sector_offset(bio, dev_sector);
 
-		eng = td_device_engine(trbs->rdev->tr_members[dev].trm_device);
-
-		if (0) printk(" SECTOR %llu TO DEV [%llu] %s SECTOR %llu [%llu:%llu] (%u bytes)\n",
+		if (DEBUG_STRIPE_PRINTK) printk(" - SECTOR %llu TO DEV [%llu] %s SECTOR %llu [%llu:%llu] (%u bytes)\n",
 				sector, dev, td_eng_name(eng),
 				dev_sector, piece, offset,
 				td_bio_get_byte_size(bio));
 
-
 		td_engine_queue_bio(eng, bio);
+	} else {
+		/* Not active, trm may even be missing */
+		td_bio_endio(NULL, bio, -EIO, 0);
 	}
 	trbs->bio_count++;
 }
@@ -135,6 +173,7 @@ static void tr_stripe_bio (struct td_biogrp *bg, td_bio_ref bio, void *opaque)
 
 static int tr_stripe_request (struct td_raid *rdev, td_bio_ref bio)
 {
+	struct td_biogrp_options opts;
 	struct tr_stripe_bio_state state;
 	int rc;
 
@@ -142,7 +181,12 @@ static int tr_stripe_request (struct td_raid *rdev, td_bio_ref bio)
 	state.obio = bio;
 	state.bio_count = 0;
 
-	rc = td_bio_split(bio, TERADIMM_DATA_BUF_SIZE, tr_stripe_bio, &state);
+	opts.split_size = TD_PAGE_SIZE;
+	opts.duplicate_count = 1;
+	opts.submit_part = tr_stripe_bio;
+	opts.error_part = tr_stripe_part_error;
+
+	rc = td_biogrp_create(bio, &opts, &state);
 	
 	if (rc < 0) {
 		td_raid_warn(rdev, "Could not split BIO for stripe\n");
@@ -153,36 +197,40 @@ static int tr_stripe_request (struct td_raid *rdev, td_bio_ref bio)
 }
 
 
-static int tr_stripe_check_member (struct td_raid *rdev, struct td_device *dev, int first)
+static int tr_stripe_check_member (struct td_raid *rdev, struct td_device *dev)
 {
-	struct td_osdev_block_params *p = &tr_stripe(rdev)->block_params;
 	struct td_engine *eng = td_device_engine(dev);
 
-	if (first) {
+	if (TR_MEMBERSET_EMPTY(rdev) && ! tr_conf_var_get(rdev, CAPACITY)) {
 		/* If this is the 1st device, it dictates RAID block_params */
-		p->capacity = td_engine_capacity(eng);
+		td_raid_debug(rdev, "Initializing stripe conf from %s\n",
+				td_device_name(dev));
 
-		p->bio_max_bytes =
-			td_eng_conf_var_get(eng, BIO_MAX_BYTES);
-		p->bio_sector_size =
-			td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE);
-		p->hw_sector_size =
-			td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE);
+		tr_stripe_var_set(rdev, DEV_LBAS,
+				td_engine_lbas(eng) &
+				~(tr_stripe_var_get(rdev, DEV_STRIDE)-1) );
+
+		tr_conf_var_set(rdev, BIO_SECTOR_SIZE,
+				td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE));
+		tr_conf_var_set(rdev, HW_SECTOR_SIZE,
+				td_eng_conf_hw_var_get(eng, HW_SECTOR_SIZE));
 		
-		/* But we don't do discard on raids */
-		p->discard = 0;
+		tr_conf_var_set(rdev, CAPACITY,
+				tr_stripe_var_get(rdev, DEV_LBAS)
+				* tr_conf_var_get(rdev, MEMBERS)
+				* (1<<SECTOR_SHIFT) );
 
-		/* And we'll save how many usable LBAs we have */
-		tr_stripe(rdev)->dev_lbas = (p->capacity >> SECTOR_SHIFT) & ~(tr_stripe(rdev)->stride);
+		if (! tr_conf_var_get(rdev, BIO_MAX_BYTES) )
+				tr_conf_var_set(rdev, BIO_MAX_BYTES,
+					td_eng_conf_var_get(eng, BIO_MAX_BYTES));
 	} else {
 		/*
 		* This new device must match the current raid block_params,
 		* or * not be allowed to join the raid
 		*/
-		if ( ( td_engine_capacity(eng) >> SECTOR_SHIFT) < tr_stripe(rdev)->dev_lbas
-				|| p->bio_max_bytes != td_eng_conf_var_get(eng, BIO_MAX_BYTES)
-				|| p->bio_sector_size != td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE)
-				|| p->hw_sector_size != td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE) ) {
+		if ( ( td_engine_lbas(eng) < tr_stripe_var_get(rdev, DEV_LBAS))
+				|| tr_conf_var_get(rdev, BIO_SECTOR_SIZE) != td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE)
+				|| tr_conf_var_get(rdev, HW_SECTOR_SIZE) != td_eng_conf_hw_var_get(eng, HW_SECTOR_SIZE) ) {
 			return -EINVAL;
 		}
 	}
@@ -190,26 +238,50 @@ static int tr_stripe_check_member (struct td_raid *rdev, struct td_device *dev, 
 	return 0;
 }
 
+static int tr_stripe_handle_member (struct td_raid *rdev, int idx)
+{
+	struct tr_member *trm = rdev->tr_members + idx;
+
+	/* In stripe, sync is a NO-OP, we go active */
+	if (trm->trm_state == TR_MEMBER_SYNC) {
+		trm->trm_state = TR_MEMBER_ACTIVE;
+		TR_ACTIVESET_SET(rdev, idx);
+	}
+
+	if (TR_ACTIVESET_FULL(rdev) ) {
+		td_raid_info(rdev, "STRIPE MEMBER CHANGE: OPTIMAL\n");
+		tr_enter_run_state(rdev, OPTIMAL);
+	} else {
+		td_raid_info(rdev, "STRIPE MEMBER CHANGE: FAILED\n");
+		tr_enter_run_state(rdev, FAILED);
+	}
+
+	return 0;
+}
+static int tr_stripe_fail_member (struct td_raid *rdev, int idx)
+{
+	//struct tr_member *trm = rdev->tr_members + idx;
+
+	tr_enter_run_state(rdev, FAILED);
+
+	return 0;
+}
+
 int tr_stripe_online (struct td_raid *rdev)
 {
-	struct td_osdev_block_params *p = &rdev->os.block_params;
+	if (! TR_MEMBERSET_FULL(rdev) ) {
+		td_raid_err(rdev, "Stripe cannot go online, members missing\n");
+		return -EINVAL;
+	}
 
-	uint64_t capacity;
-	
 	td_raid_info(rdev, "Bringing stripe online:\n");
-	p->bio_max_bytes = tr_stripe(rdev)->block_params.bio_max_bytes;
-	p->hw_sector_size = tr_stripe(rdev)->block_params.hw_sector_size;
-	p->bio_sector_size = tr_stripe(rdev)->block_params.bio_sector_size;
 
-	capacity = SECTOR_SIZE * tr_stripe(rdev)->dev_lbas
-			* tr_conf_var_get(rdev, MEMBERS);
-	p->capacity = capacity;
-
-
-	td_raid_info(rdev, " - stride %u [%x]\n",
-			tr_stripe(rdev)->stride, tr_stripe(rdev)->stride);
-	td_raid_info(rdev,  " - %llu [%llu] LBAs over %llu devs\n",
-			tr_stripe(rdev)->dev_lbas, tr_stripe(rdev)->dev_lbas,
+	td_raid_info(rdev, " - stride %llu [%llx]\n",
+			tr_stripe_var_get(rdev, DEV_STRIDE),
+			tr_stripe_var_get(rdev, DEV_STRIDE));
+	td_raid_info(rdev,  " - %llu [%llx] LBAs over %llu devs\n",
+			tr_stripe_var_get(rdev, DEV_LBAS),
+			tr_stripe_var_get(rdev, DEV_LBAS),
 			tr_conf_var_get(rdev, MEMBERS));
 
 	return 0;
@@ -222,11 +294,11 @@ static int tr_stripe_init (struct td_raid *rdev)
 	if (!p)
 		return -ENOMEM;
 	
-	p->stride = 8;
-
-	p->conf[TR_CONF_STRIPE_STRIDE] = p->stride * SECTOR_SIZE;
-	
 	rdev->ops_priv = p;
+
+	tr_stripe_var_set(rdev, DEV_STRIDE, 8);
+	tr_stripe_var_set(rdev, STRIDE, 8<<SECTOR_SHIFT);
+	
 	return 0;
 }
 
@@ -241,6 +313,8 @@ static int tr_stripe_get_conf (struct td_raid *rdev, uint32_t var, uint64_t *val
 {
 	switch (var) {
 	case TR_CONF_STRIPE_STRIDE:
+	case TR_CONF_STRIPE_DEV_LBAS:
+	case TR_CONF_STRIPE_DEV_STRIDE:
 		*val = tr_stripe(rdev)->conf[var];
 		return 0;
 
@@ -253,6 +327,14 @@ static int tr_stripe_get_conf (struct td_raid *rdev, uint32_t var, uint64_t *val
 static int tr_stripe_set_conf (struct td_raid *rdev, uint32_t var, uint64_t val)
 {
 	switch (var) {
+	case TR_CONF_STRIPE_DEV_STRIDE:
+		/*
+		 * This is the STRIDE, as LBA value.  We will adjust
+		 * to bytes, and consider this as a STRIDE set
+		 */
+		var = TR_CONF_STRIPE_STRIDE;
+		val <<= SECTOR_SHIFT;
+		/* Fall through */
 	case TR_CONF_STRIPE_STRIDE:
 		if (val & (TD_PAGE_SIZE-1) ) {
 			td_raid_err(rdev, "Invalid STRIDE size: %llu not aligned\n", val);
@@ -262,12 +344,22 @@ static int tr_stripe_set_conf (struct td_raid *rdev, uint32_t var, uint64_t val)
 			td_raid_err(rdev, "Invalid STRIDE size: %llu too small\n", val);
 			return -EPERM;
 		}
+		if (!val || (val & (val - 1))) {
+			td_raid_err(rdev, "Invalid STRIDE size: %llu not power of 2\n", val);
+			return -EPERM;
+		}
 
+		/* Set our DEV_STRIDE, in LBAs */
+		tr_stripe_var_set(rdev, DEV_STRIDE, val >> SECTOR_SHIFT);
+
+		td_raid_info(rdev, "STRIPE set to %llu LBAs from %llu bytes\n",
+				tr_stripe_var_get(rdev, DEV_STRIDE), val);
+
+		/* Fall through to the set for STRIDE */
+
+	case TR_CONF_STRIPE_DEV_LBAS:
 		tr_stripe(rdev)->conf[var] = val;
-		/* Mirror our LBA version */
-		tr_stripe(rdev)->stride = val >> SECTOR_SHIFT;
-		td_raid_info(rdev, "STRIPE set to %u LBAs from %llu bytes\n",
-				tr_stripe(rdev)->stride, val);
+		td_raid_debug(rdev, "CONF [%u] set to %llu\n", var, val);
 		return 0;
 
 	case TR_CONF_STRIPE_MAX:
@@ -281,6 +373,8 @@ struct td_raid_ops tr_stripe_ops = {
 	._init                   = tr_stripe_init,
 	._destroy                = tr_stripe_destroy,
 	._check_member           = tr_stripe_check_member,
+	._handle_member          = tr_stripe_handle_member,
+	._fail_member            = tr_stripe_fail_member,
 	._online                 = tr_stripe_online,
 	._request                = tr_stripe_request,
 	

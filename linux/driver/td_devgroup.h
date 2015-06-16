@@ -110,10 +110,6 @@ struct td_devgroup {
 
 	struct td_work_node dg_work_node;
 
-#ifndef TERADIMM_CONFIG_AVOID_EVENTS
-	wait_queue_head_t   dg_event;       /**< events that the worker thread waits on */
-#endif
-
 #ifdef CONFIG_TERADIMM_TRACK_CPU_USAGE
 	struct td_cpu_stats dg_cpu_stats;   /**< statistics on where time is spent */
 #endif
@@ -130,7 +126,6 @@ struct td_devgroup {
 
 	spinlock_t          dg_endio_lock;
 	struct bio_list     dg_endio_success;
-	struct bio_list     dg_endio_failure;
 	uint64_t            dg_endio_count;
 	unsigned long       dg_endio_ts;
 #endif
@@ -192,7 +187,7 @@ extern int td_devgroup_add_device(struct td_devgroup*, struct td_device*);
 extern int td_devgroup_remove_device(struct td_devgroup*, struct td_device*);
 
 #ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
-extern void td_devgroup_queue_endio(struct td_devgroup *eng, td_bio_ref bio, int result);
+extern void td_devgroup_queue_endio_success(struct td_devgroup *eng, td_bio_ref bio);
 #endif
 
 
@@ -211,23 +206,12 @@ static inline bool td_devgroup_endio_needs_poke(struct td_devgroup *dg, unsigned
 	return false;
 }
 
-
-
 static inline void td_devgroup_poke(struct td_devgroup *dg)
 {
-	int after;
+	if (unlikely (!dg))
+		return;
 
-	if (likely (dg)) {
-		after = atomic_sub_return(1, &dg->dg_work_node.wn_worker_tokens_idle);
-		if (after >= 0) {
-			atomic_inc(&dg->dg_work_node.wn_worker_tokens);
-#ifndef TERADIMM_CONFIG_AVOID_EVENTS
-			wake_up_interruptible(&dg->dg_event);
-#endif
-		}
-		else
-			atomic_inc(&dg->dg_work_node.wn_worker_tokens_idle);
-	}
+	td_work_node_poke(&dg->dg_work_node);
 }
 
 /* locking the devgroup mutex */

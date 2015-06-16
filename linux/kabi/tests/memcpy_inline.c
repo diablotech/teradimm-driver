@@ -1,5 +1,4 @@
-#define __KERNEL__
-#include <linux/kconfig.h>
+#include <linux/kernel.h>
 #include <linux/types.h>
 
 
@@ -69,9 +68,9 @@ static inline void td_memcpy_8x8_movq_xsum128(void *dst, const void *src,
 		: "[src]"(src), "[dst]"(dst), "[len]"(len)
 		);
 }
+static uint64_t values[1000];
 void foo (void *dst, void *src, unsigned int len, uint64_t *xsum)
 {
-	uint64_t values[1000];
 	int i;
 	for (i = 0; i < 1000; i++)
 		values[i] = i;

@@ -23,6 +23,7 @@ LINUX_OBJS = td_drv.o \
 	     td_token_bio.o \
 	     td_mapper_linux.o \
 	     td_bio_linux.o \
+	     td_biogrp.o \
 	     td_worker.o \
 	     td_devgroup.o \
 	     td_block.o \
@@ -53,19 +54,20 @@ COMMON_OBJS = td_engine.o \
 	      td_eng_completion.o \
 	      td_monitor.o \
 	      td_stash.o \
-	      td_biogrp.o \
 	      td_token.o \
+	      td_trim.o \
 	      td_ucmd.o \
 	      td_ioctl.o \
 	      td_util.o \
 	      tr_stripe.o \
 	      tr_mirror.o\
+	      tr_mirror_resync.o\
 
 LINUX_OBJS += $(call CONFIG_IF, CONFIG_TERADIMM_SIMULATOR, td_simulator.o td_sim_td.o td_eng_sim_td.o)
 
 LINUX_OBJS += $(call CONFIG_IF, CONFIG_TERADIMM_SYSFS, td_eng_conf_sysfs.o)
 LINUX_OBJS += $(call CONFIG_IF, CONFIG_TERADIMM_ACPI_ASL, td_scan_asl.o)
-LINUX_OBJS += $(call CONFIG_IF, CONFIG_TERADIMM_SGIO, td_dev_ata.o)
+LINUX_OBJS += $(call CONFIG_IF, CONFIG_TERADIMM_SGIO, td_sgio.o td_dev_scsi.o td_dev_ata.o)
 LINUX_OBJS += $(call CONFIG_IF, CONFIG_TERADIMM_STM, td_eng_stm_td.o)
 
 
@@ -115,6 +117,7 @@ endif		## LOCAL / KERNEL RELEASE / VMWARE DDKnma
 EXTRA_CFLAGS	:= ${WARNING_CFLAGS} -Wall \
 		-DTERADIMM_VERSION='"${TERADIMM_VERSION}"' \
 		-DTERADIMM_REVISION='"${TERADIMM_REVISION}"' \
+		-g \
 		-I${TOP}/linux/driver \
 		-I${TOP}/common/driver -I${TOP}/common/util -I${TOP}/common/util \
 		$(if ${TERADIMM_KABI_H},-include ${TERADIMM_KABI_H},$(error you need to define TERADIMM_KABI_H)) \

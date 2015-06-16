@@ -64,7 +64,7 @@
 #include "td_ucmd.h"
 #include "td_eng_hal.h"
 #include "td_discovery.h"
-#include "td_dev_ata.h"
+#include "td_sgio.h"
 #include "td_memspace.h"
 #include "td_osdev.h"
 #include "td_mapper.h"
@@ -95,8 +95,9 @@ static uint td_scan_wait_sec = 20;
 static ulong td_external_train = 0;
 static uint td_dev_per_group = 2;
 static int td_default_dg_nice = -19;
-static char* td_discovery = "bios,asl";
+static char* td_discovery = "bios";
 static int td_discovery_target = TD_DISCOVERY_TARGET_RAID;
+static uint td_discovery_threaded = 1;
 
 module_param_named(scan, td_scan_enable, uint, 0444);
 module_param_named(scan_wait_sec, td_scan_wait_sec, uint, 0444);
@@ -109,6 +110,7 @@ module_param_named(default_devgroup_nice, td_default_dg_nice, int, 0444);
 
 module_param_named(discovery, td_discovery, charp, 0444);
 module_param_named(discovery_target, td_discovery_target, int, 0444);
+module_param_named(discovery_threaded, td_discovery_threaded, int, 0444);
 
 #ifdef CONFIG_TERADIMM_STATIC_NODEMAP
 uint td_socketmap[MAX_NUMNODES];
@@ -120,10 +122,6 @@ MODULE_PARM_DESC(socketmap, "Static socket -> CPU map");
 
 atomic_t        td_discovery_in_progress;
 
-#ifdef CONFIG_TERADIMM_FORCE_SSD_HACK
-int force_ssd = -1;
-module_param_named(force_ssd, force_ssd, int, 0644);
-#endif
 
 MODULE_PARM_DESC(scan,
 		"Scan the ACPI & SMBIOS table for device information and "
@@ -204,7 +202,8 @@ error_completion:
 static struct td_device *__td_device_create(
 		const char *name, const char *slot_name,
 		uint64_t phys_mem_base, uint64_t phys_mem_size,
-		uint32_t irq_num, uint16_t memspeed, uint16_t cpu_socket)
+		uint64_t avoid_mask, uint32_t irq_num, uint16_t memspeed,
+		uint16_t cpu_socket)
 {
 	int rc;
 	struct td_device *dev;
@@ -231,7 +230,7 @@ static struct td_device *__td_device_create(
 	td_os_info(&dev->os, "Device %s is found in %s\n",
 			name, (dev->td_slot ? : "(unknown)"));
 
-	rc = td_mapper_init(&dev->td_mapper, name, phys_mem_base, phys_mem_size);
+	rc = td_mapper_init(&dev->td_mapper, name, phys_mem_base, phys_mem_size, avoid_mask);
 	if (unlikely(rc))
 		goto error_mapper;
 
@@ -500,7 +499,7 @@ static int td_device_create_and_online (void* arg)
 	pr_info("%s create device '%s' with base=0x%llx and size=0x%llx in group '%s'\n",
 			source, info->dev_name, info->offset, info->size, dg->dg_name);
 	ret = td_device_create(info->dev_name, info->bank_locator, info->offset,
-			info->size, info->irq, info->memspeed, info->uid.cpu_socket);
+			info->size, info->avoid_mask, info->irq, info->memspeed, info->uid.cpu_socket);
 	if (ret) {
 		pr_err("%s ERROR: Can't create device: error %d\n", source, ret);
 		goto exit_nocreate;
@@ -581,6 +580,7 @@ exit_train:
 	td_device_put(dev);
 exit_nodev:
 exit_nocreate:
+	td_devgroup_put(dg);
 exit_nogrp:
 	return ret;
 }
@@ -640,7 +640,7 @@ int __td_device_create_discovered (void* data)
 	int loop_count = 0;
 
 	ret = -ENODEV;
-	dg = td_device_group_on_node(dev_info->source, args->dev_name, dev_info->socket);
+	dg = td_device_group_on_node(args->dev_name, dev_info->source, dev_info->socket);
 	if (!dg)
 		goto exit_nogrp;
 
@@ -650,7 +650,8 @@ int __td_device_create_discovered (void* data)
 			dev_info->mem_base, dev_info->mem_size, dg->dg_name);
 	ret = td_device_create(dev_name, dev_info->bank_locator,
 			dev_info->mem_base, dev_info->mem_size,
-			dev_info->irq, dev_info->mem_speed, dev_info->socket);
+			dev_info->mem_avoid_mask, dev_info->irq, dev_info->mem_speed,
+			dev_info->socket);
 
 	/* And now we are created, we release the mutex */
 	atomic_dec(&td_discovery_in_progress);
@@ -748,7 +749,9 @@ int __td_device_create_discovered (void* data)
 			}
 
 			if (td_device_check_state(dev, RAID_MEMBER) ) {
-				pr_info("%s put device %s into raid\n", dev_info->source, dev_name);
+				pr_info("%s put device %s into raid %s\n",
+						dev_info->source, dev_name,
+						td_raid_name(dev->td_raid));
 				break;
 			}
 		}
@@ -784,6 +787,7 @@ exit_train:
 
 exit_nodev:
 exit_nocreate:
+	td_devgroup_put(dg);
 exit_nogrp:
 	dev_info->done(dev_info);
 	kfree(args);
@@ -825,13 +829,21 @@ int td_device_create_discovered (struct td_discovered_info *dev_info, void* opaq
 
 	atomic_inc(&td_discovery_in_progress);
 
-	worker = kthread_create(__td_device_create_discovered,
-			args, "td/%s-%s", dev_info->source, args->dev_name);
+	switch (td_discovery_threaded) {
+	case 0:
+		__td_device_create_discovered(args);
+		break;
+	case 1:
+	default:
+		worker = kthread_create(__td_device_create_discovered,
+				args, "td/%s-%s", dev_info->source, args->dev_name);
 
-	if (cpu != 0) kthread_bind(worker, cpu);
+		if (cpu != 0) kthread_bind(worker, cpu);
 
-	wake_up_process(worker);
-	schedule();
+		wake_up_process(worker);
+		schedule();
+		break;
+	}
 	
 	return 0;
 }
@@ -990,7 +1002,8 @@ static int __iter_device_check_exists(struct td_osdev *dev, void* data)
 
 int td_device_create(const char *name, const char *slot_name,
 		uint64_t phys_mem_base, uint64_t phys_mem_size,
-		uint32_t irq_num, uint16_t memspeed, uint16_t cpu_socket)
+		uint64_t avoid_mask, uint32_t irq_num, uint16_t memspeed,
+		uint16_t cpu_socket)
 {
 	int rc;
 	struct td_device *dev = NULL;
@@ -1008,7 +1021,7 @@ int td_device_create(const char *name, const char *slot_name,
 
 	/* allocate/create a new device */
 	dev = __td_device_create(name, slot_name, phys_mem_base, phys_mem_size,
-			irq_num, memspeed, cpu_socket);
+			avoid_mask, irq_num, memspeed, cpu_socket);
 	if (IS_ERR(dev)) {
 		rc = PTR_ERR(dev);
 		pr_err("Failed to create device '%s', err=%d.\n", name, rc);
@@ -1078,7 +1091,8 @@ int td_device_delete(const char *name)
 	}
 	
 	if (td_device_check_state(dev, RAID_MEMBER) ) {
-		td_dev_err(dev, "ERROR: device in a raid\n");
+		td_dev_err(dev, "ERROR: device in raid \"%s\"\n",
+				td_raid_name(dev->td_raid));
 		goto bail_with_mutex;
 	}
 
@@ -1492,7 +1506,7 @@ int __td_device_ioctl(struct td_device* dev, unsigned int cmd,
 		struct td_ioctl_device_put_reg pr;
 		struct td_ioctl_device_trace_config trc_conf;
 		struct td_ioctl_device_trace_read trc_read;
-		struct td_ioctl_device_counters dev_cntrs;
+		struct td_ioctl_counters dev_cntrs;
 		struct td_ioctl_device_stats dev_stats;
 		struct td_ioctl_device_raw_buffer dev_raw;
 		struct td_ioctl_device_params param;
@@ -1501,7 +1515,7 @@ int __td_device_ioctl(struct td_device* dev, unsigned int cmd,
 		struct td_ioctl_device_error_injection e_conf;
 		struct td_ioctl_device_ecc_counters e_counters;
 #ifdef CONFIG_TERADIMM_SGIO
-		sg_io_hdr_t sg_hdr;
+		void *sg_hdr;
 #endif
 	}__user *u_arg, *k_arg, __static_arg, *__big_arg = NULL;
 	unsigned copy_in_size, copy_out_size, big_size = 0;
@@ -1549,11 +1563,11 @@ int __td_device_ioctl(struct td_device* dev, unsigned int cmd,
 		/* copy in the base structure */
 		rc = -EFAULT;
 		if (copy_from_user(k_arg, u_arg,
-					sizeof(struct td_ioctl_device_counters)))
+					sizeof(struct td_ioctl_counters)))
 			goto bail_ioctl;
 
 		/* based on count provided, figure out how much actually */
-		big_size = TD_IOCTL_DEVICE_COUNTER_SIZE(k_arg->dev_cntrs.count);
+		big_size = TD_IOCTL_COUNTER_SIZE(k_arg->dev_cntrs.count);
 
 		copy_in_size = big_size;
 		copy_out_size = copy_in_size;
@@ -1749,8 +1763,7 @@ int __td_device_ioctl(struct td_device* dev, unsigned int cmd,
 
 #ifdef CONFIG_TERADIMM_SGIO
 	case SG_IO:
-		rc = td_device_block_sgio(td_device_engine(dev),
-				&k_arg->sg_hdr);
+		rc = td_block_sgio(&dev->os, &k_arg->sg_hdr);
 		goto handled;
 #endif
 	case BLKFLSBUF: /* block flush buffers */

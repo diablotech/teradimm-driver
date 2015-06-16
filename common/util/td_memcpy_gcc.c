@@ -58,6 +58,8 @@
  * or to be standalone, and get non-inlined versions
  */
 
+#define DEBUG_ALIAS_CACHE_PRINTK 0
+
 #if   defined(__KERNEL__)
 
 #ifdef SUPPRESS_KERNEL_WARNINGS
@@ -87,7 +89,6 @@
 #ifndef MEMCPY_INLINE
 #define MEMCPY_INLINE
 #endif
-
 
 
 MEMCPY_INLINE void *td_memcpy_movntq(void *dst, const void *src,
@@ -1045,6 +1046,8 @@ MEMCPY_INLINE void td_memcpy_movntdqa_64(void *dst, const void *src,
 
 	kernel_fpu_begin();
 	__asm__ __volatile__ (
+		"lfence                                 \n"
+
 		"1:\n"
 
 		"movntdqa    0*16(%%rsi),  %%xmm0       \n"
@@ -1072,6 +1075,421 @@ MEMCPY_INLINE void td_memcpy_movntdqa_64(void *dst, const void *src,
 #endif
 }
 
+MEMCPY_INLINE int td_memcpy_alias_compare (void *dst, const void* src,
+		const void* alias, unsigned int len)
+{
+	memcpy(dst, src, len);
+	if (memcmp(dst,src,len) )
+		return -EIO;
+	return 0;
+}
+
+/*
+ * read from source and cache, if different
+ * read from alias, write to destination
+ */
+MEMCPY_INLINE void td_memcpy_cached_alias_compare(void *dst,
+		const void *src, void *cache, const void *alias, unsigned int len)
+{
+	if (memcmp(src,cache, len)) {
+		clflush_cache_range(alias, len);
+		src = alias;
+	}
+	memcpy(dst, src, len);
+}
+
+/* return negative on failure */
+MEMCPY_INLINE int td_memcpy_movntdqa_64_alias_compare(void *dst,
+		const void *src, const void *alias, unsigned int len)
+{
+	register int64_t result = -EIO;
+#if defined __KERNEL__ && ! defined KABI__movntdqa
+#warning movntdqa not supported by compiler
+	BUG_ON(1);
+#else
+	register uint64_t t0, t1;
+#if 0
+	WARN_ON((uintptr_t)dst&63ULL);
+	WARN_ON((uintptr_t)src&63ULL);
+	WARN_ON(len&63ULL);
+#endif
+
+	/* fall back to slow copy on misalignment */
+	if ( (uintptr_t)dst&15ULL || (uintptr_t)src&15ULL
+			|| (uintptr_t)alias&15ULL || len&63ULL ) {
+		__builtin_memcpy(dst, src, len);
+		if (memcmp(dst, alias, len) )
+			return -EIO;
+		return 0;
+	}
+
+	kernel_fpu_begin();
+	__asm__ __volatile__ (
+		"lfence                                    \n"
+
+		"1:                                        \n"
+
+		"movntdqa    0*16(%[src]),   %%xmm0        \n"
+		"movntdqa    1*16(%[src]),   %%xmm1        \n"
+		"movntdqa    2*16(%[src]),   %%xmm2        \n"
+		"movntdqa    3*16(%[src]),   %%xmm3        \n"
+		"addq        $(4*16),        %[src]        \n"
+
+		"movntdqa    0*16(%[alias]), %%xmm4        \n"
+		"movntdqa    1*16(%[alias]), %%xmm5        \n"
+		"movntdqa    2*16(%[alias]), %%xmm6        \n"
+		"movntdqa    3*16(%[alias]), %%xmm7        \n"
+		"addq        $(4*16),        %[alias]      \n"
+
+		/* compare xmm0:3 with xmm4:7, results in xmm4:7 */
+
+		"pcmpeqq     %%xmm0,         %%xmm4        \n"
+		"pcmpeqq     %%xmm1,         %%xmm5        \n"
+		"pcmpeqq     %%xmm2,         %%xmm6        \n"
+		"pcmpeqq     %%xmm3,         %%xmm7        \n"
+
+		/* collapse xmm4:7 to xmm7 */
+
+		"pand        %%xmm4,         %%xmm5        \n"
+		"pand        %%xmm6,         %%xmm7        \n"
+		"pand        %%xmm5,         %%xmm7        \n"
+
+		/* collapse xmm7 to t0 */
+
+		"pextrq      $1, %%xmm7,     %[t0]         \n"
+		"movq        %%xmm7,         %[t1]         \n"
+		"andq        %[t1],          %[t0]         \n"
+
+		/* t0 will be -1 on success, incrementing it
+		 * gets 0 on success and sets the zero flag,
+		 * lack of zero flag means there was an error */
+
+		"incq        %[t0]                         \n"
+		"jnz         2f                            \n"
+
+		/* if everything went OK, write xmm0:3 out */
+
+		"movdqa      %%xmm0,         0*16(%[dst])  \n"
+		"movdqa      %%xmm1,         1*16(%[dst])  \n"
+		"movdqa      %%xmm2,         2*16(%[dst])  \n"
+		"movdqa      %%xmm3,         3*16(%[dst])  \n"
+		"leaq        4*16(%[dst]),   %[dst]        \n"
+
+		"subl        $64,            %[len]        \n" /* 4 * 16 == 64 */
+		"jnz         1b                            \n"
+
+		"xorq        %[result],      %[result]     \n" /* success */
+
+		"sfence                                    \n"
+
+		"2:                                        \n" /* failure */
+
+		: [src]"=&S"(src), [alias]"=&r"(alias), [dst]"=&D"(dst),
+		  [len]"=&c"(len), [result]"=&A"(result),
+		  [t0]"=&r"(t0), [t1]"=&r"(t1)
+		: "[src]"(src), "[alias]"(alias), "[dst]"(dst),
+		  "[len]"(len), "[result]"(result)
+		: "cc", "memory"
+		);
+	kernel_fpu_end();
+#endif
+
+	return result;
+}
+
+MEMCPY_INLINE void td_memcpy_movntdqa_64_cached_alias_compare(void *dst,
+		const void *src, void *cache, const void *alias, unsigned int len)
+{
+#if defined __KERNEL__ && ! defined KABI__movntdqa
+#warning movntdqa not supported by compiler
+	BUG_ON(1);
+#else
+	register uint64_t t0, t1;
+#if 0
+	WARN_ON((uintptr_t)dst&63ULL);
+	WARN_ON((uintptr_t)src&63ULL);
+	WARN_ON(len&63ULL);
+#endif
+
+	/* fall back to slow copy on misalignment */
+	if ( (uintptr_t)dst&15ULL || (uintptr_t)src&15ULL
+			|| (uintptr_t)alias&15ULL || len&63ULL ) {
+		memcpy(dst, src, len);
+		return;
+	}
+
+	kernel_fpu_begin();
+	__asm__ __volatile__ (
+		"lfence                                     \n"
+
+		"1:                                         \n"
+
+		/* ----------------------------------------- */
+
+		"movntdqa    0*16(%[src]),   %%xmm0         \n"
+		"movntdqa    1*16(%[src]),   %%xmm1         \n"
+		"movntdqa    2*16(%[src]),   %%xmm2         \n"
+		"movntdqa    3*16(%[src]),   %%xmm3         \n"
+		"addq        $(4*16),        %[src]         \n"
+
+		"movdqa      0*16(%[cache]), %%xmm4         \n"
+		"movdqa      1*16(%[cache]), %%xmm5         \n"
+		"movdqa      2*16(%[cache]), %%xmm6         \n"
+		"movdqa      3*16(%[cache]), %%xmm7         \n"
+
+		/* compare xmm0:3 with xmm4:7, results in xmm4:7 */
+
+		"pcmpeqq     %%xmm0,         %%xmm4         \n"
+		"pcmpeqq     %%xmm1,         %%xmm5         \n"
+		"pcmpeqq     %%xmm2,         %%xmm6         \n"
+		"pcmpeqq     %%xmm3,         %%xmm7         \n"
+
+		/* collapse xmm4:7 to xmm7 */
+
+		"pand        %%xmm4,         %%xmm5         \n"
+		"pand        %%xmm6,         %%xmm7         \n"
+		"pand        %%xmm5,         %%xmm7         \n"
+
+		/* collapse xmm7 to t0 */
+
+		"pextrq      $1, %%xmm7,     %[t0]          \n"
+		"movq        %%xmm7,         %[t1]          \n"
+		"andq        %[t1],          %[t0]          \n"
+
+		/* t0 will be -1 on success, incrementing it
+		 * gets 0 on success and sets the zero flag. */
+
+		"incq        %[t0]                          \n"
+
+		/* non-zero means we are different than the
+		 * cached copy and can write the destination */
+
+		"jnz         2f                             \n"
+
+		/* ----------------------------------------- */
+
+		/* cachelines were the same, read from alias */
+
+		"movntdqa    0*16(%[alias]), %%xmm0         \n"
+		"movntdqa    1*16(%[alias]), %%xmm1         \n"
+		"movntdqa    2*16(%[alias]), %%xmm2         \n"
+		"movntdqa    3*16(%[alias]), %%xmm3         \n"
+
+		/* ----------------------------------------- */
+
+		/* cachelines were differnet, data must be new */
+
+		"2:                                         \n"
+		"movdqa      %%xmm0,         0*16(%[dst])   \n" /* write dest */
+		"movdqa      %%xmm1,         1*16(%[dst])   \n"
+		"movdqa      %%xmm2,         2*16(%[dst])   \n"
+		"movdqa      %%xmm3,         3*16(%[dst])   \n"
+		"leaq        4*16(%[dst]),   %[dst]         \n"
+
+		"movdqa      %%xmm0,         0*16(%[cache]) \n" /* update cache */
+		"movdqa      %%xmm1,         1*16(%[cache]) \n"
+		"movdqa      %%xmm2,         2*16(%[cache]) \n"
+		"movdqa      %%xmm3,         3*16(%[cache]) \n"
+		"leaq        4*16(%[cache]), %[cache]       \n"
+
+
+		"addq        $(4*16),        %[alias]       \n" /* advance alias */
+
+		"subl        $64,            %[len]         \n" /* 4 * 16 == 64 */
+		"jnz         1b                             \n"
+
+		/* success */
+
+		"sfence                                     \n"
+
+		: [src]"=&S"(src), [dst]"=&D"(dst),
+		  [cache]"=&r"(cache), [alias]"=&r"(alias),
+		  [len]"=&c"(len), [t0]"=&r"(t0), [t1]"=&r"(t1)
+		: "[src]"(src), "[dst]"(dst),
+		  "[cache]"(cache), "[alias]"(alias),
+		  "[len]"(len)
+		: "cc", "memory"
+		);
+	kernel_fpu_end();
+#endif
+}
+
+/* return 0 on success,
+ *        1 if data data duplication was detected
+ *       -1 if data corruption was detected and fixed via alias */
+MEMCPY_INLINE int td_memcpy_movntdqa_64_cached_alias_compare_test(void *dst,
+		const void *src, void *cache, const void *alias, unsigned int len)
+{
+#if defined __KERNEL__ && ! defined KABI__movntdqa
+#warning movntdqa not supported by compiler
+	BUG_ON(1);
+#else
+	register uint64_t t0, t1;
+	/* count number of times source != cache */
+	register int64_t data_repeat_detected = 0;
+	/* count number of times source != alias */
+	register int64_t corrected_via_alias = 0;
+#if 0
+	WARN_ON((uintptr_t)dst&63ULL);
+	WARN_ON((uintptr_t)src&63ULL);
+	WARN_ON(len&63ULL);
+#endif
+
+	/* fall back to slow copy on misalignment */
+	if ( (uintptr_t)dst&15ULL || (uintptr_t)src&15ULL
+			|| (uintptr_t)alias&15ULL || len&63ULL ) {
+		memcpy(dst, src, len);
+		return 0;
+	}
+
+	kernel_fpu_begin();
+	__asm__ __volatile__ (
+		"lfence                                     \n"
+
+		"1:                                         \n"
+
+		/* ----------------------------------------- */
+
+		"movntdqa    0*16(%[src]),   %%xmm0         \n"
+		"movntdqa    1*16(%[src]),   %%xmm1         \n"
+		"movntdqa    2*16(%[src]),   %%xmm2         \n"
+		"movntdqa    3*16(%[src]),   %%xmm3         \n"
+		"addq        $(4*16),        %[src]         \n"
+
+		"movdqa      0*16(%[cache]), %%xmm4         \n"
+		"movdqa      1*16(%[cache]), %%xmm5         \n"
+		"movdqa      2*16(%[cache]), %%xmm6         \n"
+		"movdqa      3*16(%[cache]), %%xmm7         \n"
+
+		/* compare xmm0:3 with xmm4:7, results in xmm4:7 */
+
+		"pcmpeqq     %%xmm0,         %%xmm4         \n"
+		"pcmpeqq     %%xmm1,         %%xmm5         \n"
+		"pcmpeqq     %%xmm2,         %%xmm6         \n"
+		"pcmpeqq     %%xmm3,         %%xmm7         \n"
+
+		/* collapse xmm4:7 to xmm7 */
+
+		"pand        %%xmm4,         %%xmm5         \n"
+		"pand        %%xmm6,         %%xmm7         \n"
+		"pand        %%xmm5,         %%xmm7         \n"
+
+		/* collapse xmm7 to t0 */
+
+		"pextrq      $1, %%xmm7,     %[t0]          \n"
+		"movq        %%xmm7,         %[t1]          \n"
+		"andq        %[t1],          %[t0]          \n"
+
+		/* t0 will be -1 on success, incrementing it
+		 * gets 0 on success and sets the zero flag. */
+
+		"incq        %[t0]                          \n"
+
+		/* non-zero means we are different than the
+		 * cached copy and can write the destination */
+
+		"jnz         3f                             \n"
+
+		/* ----------------------------------------- */
+
+		/* cachelines were the same, read from alias */
+
+		"movntdqa    0*16(%[alias]), %%xmm4         \n"
+		"movntdqa    1*16(%[alias]), %%xmm5         \n"
+		"movntdqa    2*16(%[alias]), %%xmm6         \n"
+		"movntdqa    3*16(%[alias]), %%xmm7         \n"
+
+		/* compare xmm0:3 with xmm4:7, results in xmm4:7 */
+
+		"pcmpeqq     %%xmm0,         %%xmm4         \n"
+		"pcmpeqq     %%xmm1,         %%xmm5         \n"
+		"pcmpeqq     %%xmm2,         %%xmm6         \n"
+		"pcmpeqq     %%xmm3,         %%xmm7         \n"
+
+		/* collapse xmm4:7 to xmm7 */
+
+		"pand        %%xmm4,         %%xmm5         \n"
+		"pand        %%xmm6,         %%xmm7         \n"
+		"pand        %%xmm5,         %%xmm7         \n"
+
+		/* collapse xmm7 to t0 */
+
+		"pextrq      $1, %%xmm7,     %[t0]          \n"
+		"movq        %%xmm7,         %[t1]          \n"
+		"andq        %[t1],          %[t0]          \n"
+
+		/* t0 will be -1 on success, incrementing it
+		 * gets 0 on success and sets the zero flag */
+
+		"incq        %[t0]                          \n"
+
+		/* non-zero means src != alias, which suggests
+		 * a corrupted streaming load buffer, bail */
+
+		"jnz         2f                             \n"
+
+		/* cache == src == alias */
+
+		"incq       %[data_repeat_detected]        \n"
+		"jmp        3f                              \n"
+
+		/* cache == src, src != alias */
+
+		"2:                                         \n"
+
+		"incq       %[corrected_via_alias]          \n"
+
+		/* reread the data from alias */
+
+		"movntdqa    0*16(%[alias]), %%xmm0         \n"
+		"movntdqa    1*16(%[alias]), %%xmm1         \n"
+		"movntdqa    2*16(%[alias]), %%xmm2         \n"
+		"movntdqa    3*16(%[alias]), %%xmm3         \n"
+
+		/* ----------------------------------------- */
+
+		/* cachelines were differnet, data must be new */
+
+		"3:                                         \n"
+		"movdqa      %%xmm0,         0*16(%[dst])   \n" /* write dest */
+		"movdqa      %%xmm1,         1*16(%[dst])   \n"
+		"movdqa      %%xmm2,         2*16(%[dst])   \n"
+		"movdqa      %%xmm3,         3*16(%[dst])   \n"
+		"leaq        4*16(%[dst]),   %[dst]         \n"
+
+		"movdqa      %%xmm0,         0*16(%[cache]) \n" /* update cache */
+		"movdqa      %%xmm1,         1*16(%[cache]) \n"
+		"movdqa      %%xmm2,         2*16(%[cache]) \n"
+		"movdqa      %%xmm3,         3*16(%[cache]) \n"
+		"leaq        4*16(%[cache]), %[cache]       \n"
+
+
+		"addq        $(4*16),        %[alias]       \n" /* advance alias */
+
+		"subl        $64,            %[len]         \n" /* 4 * 16 == 64 */
+		"jnz         1b                             \n"
+
+		"sfence                                     \n"
+
+		: [src]"=&S"(src), [dst]"=&D"(dst),
+		  [cache]"=&r"(cache), [alias]"=&r"(alias), [len]"=&c"(len),
+		  [t0]"=&r"(t0), [t1]"=&r"(t1),
+		  [data_repeat_detected]"=&r"(data_repeat_detected),
+		  [corrected_via_alias]"=&r"(corrected_via_alias)
+		: "[src]"(src), "[dst]"(dst),
+		  "[cache]"(cache), "[alias]"(alias), "[len]"(len),
+		  "[data_repeat_detected]"(data_repeat_detected),
+		  "[corrected_via_alias]"(corrected_via_alias)
+		: "cc", "memory"
+		);
+	kernel_fpu_end();
+#endif
+
+	return corrected_via_alias ? -1 :
+		data_repeat_detected ? 1 :
+		0;
+}
+
 MEMCPY_INLINE void td_memcpy_movntdqa_16(void *dst, const void *src,
 		unsigned int len)
 {
@@ -1093,6 +1511,8 @@ MEMCPY_INLINE void td_memcpy_movntdqa_16(void *dst, const void *src,
 
 	kernel_fpu_begin();
 	__asm__ __volatile__ (
+		"lfence                                 \n"
+
 		"1:\n"
 
 		"movntdqa    0*16(%%rsi),  %%xmm0       \n"
@@ -1451,7 +1871,256 @@ MEMCPY_INLINE void td_memcpy_8x8_movq_bad_clflush(void *dst, const void const *c
 		:
 		: "cc"
 		);
-
 }
 
+MEMCPY_INLINE int td_memcpy_cached_alias_compare_test(void *dst,
+		const void const *const src_alias[2],
+		void *cache, unsigned int len)
+{
+	register const void *a0 = src_alias[0];
+	register const void *a1 = src_alias[1];
+	register uint64_t t1, t2, t3, t4, t5, t6, t7, t8;
+	register uint64_t tmp;
+	register uint64_t l = (len + 63) & ~63;
+
+	/* read using "fast path"
+	 * - read in 64B, test last word of reach cacheline for 'bad' pattern
+	 * - if found go to slow path
+	 * - else write to destination
+	 * - repeat
+	 */
+
+	__asm__ __volatile__ (
+		"mfence                               \n"
+		"\n"
+		"\n" /* fast loop, look for 'bad' pattern */
+		"\n"
+#if 0
+		"1:                                   \n"
+		"                                     \n"
+		"movq    0*8(%[src]),   %[t1]         \n"   /* read out the src line */
+		"movq    0*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t1],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    1*8(%[src]),   %[t2]         \n"   /* read out the src line */
+		"movq    1*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t2],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    2*8(%[src]),   %[t3]         \n"   /* read out the src line */
+		"movq    2*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t3],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    3*8(%[src]),   %[t4]         \n"   /* read out the src line */
+		"movq    3*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t4],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    4*8(%[src]),   %[t5]         \n"   /* read out the src line */
+		"movq    4*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t5],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    5*8(%[src]),   %[t6]         \n"   /* read out the src line */
+		"movq    5*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t6],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    6*8(%[src]),   %[t7]         \n"   /* read out the src line */
+		"movq    6*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t7],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    7*8(%[src]),   %[t8]         \n"   /* read out the src line */
+		"movq    7*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t8],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+#else
+		"1:                                   \n"
+		"                                     \n"
+		"movq    0*8(%[src]),   %[t1]         \n"   /* read out the src line */
+		"movq    1*8(%[src]),   %[t2]         \n"   /* read out the src line */
+		"movq    2*8(%[src]),   %[t3]         \n"   /* read out the src line */
+		"movq    3*8(%[src]),   %[t4]         \n"   /* read out the src line */
+		"movq    4*8(%[src]),   %[t5]         \n"   /* read out the src line */
+		"movq    5*8(%[src]),   %[t6]         \n"   /* read out the src line */
+		"movq    6*8(%[src]),   %[t7]         \n"   /* read out the src line */
+		"movq    7*8(%[src]),   %[t8]         \n"   /* read out the old line */
+		"                                     \n"
+		"movq    0*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t1],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    1*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t2],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    2*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t3],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    3*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t4],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    4*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t5],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    5*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t6],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    6*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t7],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+		"                                     \n"
+		"movq    7*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t8],         %[tmp]        \n"   /* test against the old pattern */
+		"je      2f                           \n"
+#endif
+		"                                     \n"
+
+		"leaq    8*8(%[src]),   %[src]        \n"   /* it's good */
+		"leaq    8*8(%[cache]), %[cache]      \n"
+		"leaq    8*8(%[alias]), %[alias]      \n"
+		"                                     \n"
+		"movq    %[t1],         0*8(%[dst])   \n"   /* copy to destination */
+		"movq    %[t2],         1*8(%[dst])   \n"
+		"movq    %[t3],         2*8(%[dst])   \n"
+		"movq    %[t4],         3*8(%[dst])   \n"
+		"movq    %[t5],         4*8(%[dst])   \n"
+		"movq    %[t6],         5*8(%[dst])   \n"
+		"movq    %[t7],         6*8(%[dst])   \n"
+		"movq    %[t8],         7*8(%[dst])   \n"
+		"                                     \n"
+		"leaq    8*8(%[dst]),   %[dst]        \n"
+		"                                     \n"
+		"subq    $(8*8),        %[l]        \n"   /* count down length */
+		"jnz     1b                           \n"
+		"                                     \n"
+		"movq    $0,            %[alias]      \n"   /* alias wasn't used */
+		"jmp     9f                           \n"   /* reached the end */
+		"\n"
+		"\n" /* bad pattern found, use the alias */
+		"\n"
+		"2:                                   \n"
+		"movq    %[alias],      %[src]        \n"
+		"movq    %%rcx,         %[t1]         \n"   /* remember length */
+		"                                     \n"
+		"mfence                               \n"   /* alias must be invalidated */
+		"3:                                   \n"
+		"clflush (%[src])                     \n"
+		"leaq    8*8(%[src]),   %[src]        \n"
+		"subq    $(8*8),        %[l]        \n"   /* count down length */
+		"jnz     3b                           \n"
+		"mfence                               \n"
+		"                                     \n"
+		"movq    %[t1],         %%rcx         \n"   /* restore length */
+		"movq    $0,            %[src]        \n"   /* Overload src with repeat count */
+		"                                     \n"
+		"\n"
+		"\n" /* now reading from invalidated alias */
+		"\n"
+		"4:                                   \n"
+		"                                     \n"
+		"movq    0*8(%[alias]),   %[t1]       \n"   /* read out the cache line */
+		"movq    1*8(%[alias]),   %[t2]       \n"
+		"movq    2*8(%[alias]),   %[t3]       \n"
+		"movq    3*8(%[alias]),   %[t4]       \n"
+		"movq    4*8(%[alias]),   %[t5]       \n"
+		"movq    5*8(%[alias]),   %[t6]       \n"
+		"movq    6*8(%[alias]),   %[t7]       \n"
+		"movq    7*8(%[alias]),   %[t8]       \n"
+		"                                     \n"
+		"                                     \n"
+		"leaq    8*8(%[alias]),   %[alias]    \n"
+		"                                     \n"
+		"\n"
+		"\n" /* Compare to cache */
+		"\n"
+		"movq    0*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t1],         %[tmp]        \n"   /* test against the old pattern */
+		"jne     5f                           \n"
+		"                                     \n"
+		"movq    1*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t2],         %[tmp]        \n"   /* test against the old pattern */
+		"jne     5f                           \n"
+		"                                     \n"
+		"movq    2*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t3],         %[tmp]        \n"   /* test against the old pattern */
+		"jne     5f                           \n"
+		"                                     \n"
+		"movq    3*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t4],         %[tmp]        \n"   /* test against the old pattern */
+		"jne     5f                           \n"
+		"                                     \n"
+		"movq    4*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t5],         %[tmp]        \n"   /* test against the old pattern */
+		"jne     5f                           \n"
+		"                                     \n"
+		"movq    5*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t6],         %[tmp]        \n"   /* test against the old pattern */
+		"jne     5f                           \n"
+		"                                     \n"
+		"movq    6*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t7],         %[tmp]        \n"   /* test against the old pattern */
+		"jne     5f                           \n"
+		"                                     \n"
+		"movq    7*8(%[cache]), %[tmp]        \n"   /* read out the old line */
+		"cmpq    %[t8],         %[tmp]        \n"   /* test against the old pattern */
+		"jne     5f                           \n"
+		"                                     \n"
+		"addq    $1,            %[src]        \n"
+
+		"                                     \n"
+		"5:                                   \n"
+		"movq    %[t1],         0*8(%[dst])   \n"   /* copy to destination */
+		"movq    %[t2],         1*8(%[dst])   \n"
+		"movq    %[t3],         2*8(%[dst])   \n"
+		"movq    %[t4],         3*8(%[dst])   \n"
+		"movq    %[t5],         4*8(%[dst])   \n"
+		"movq    %[t6],         5*8(%[dst])   \n"
+		"movq    %[t7],         6*8(%[dst])   \n"
+		"movq    %[t8],         7*8(%[dst])   \n"
+		"                                     \n"
+		"movq    %[t1],         0*8(%[cache]) \n"   /* copy to old copy */
+		"movq    %[t2],         1*8(%[cache]) \n"
+		"movq    %[t3],         2*8(%[cache]) \n"
+		"movq    %[t4],         3*8(%[cache]) \n"
+		"movq    %[t5],         4*8(%[cache]) \n"
+		"movq    %[t6],         5*8(%[cache]) \n"
+		"movq    %[t7],         6*8(%[cache]) \n"
+		"movq    %[t8],         7*8(%[cache]) \n"
+
+		"                                     \n"
+		"leaq    8*8(%[cache]), %[cache]      \n"
+		"leaq    8*8(%[dst]),   %[dst]        \n"
+		"                                     \n"
+		"subq    $(8*8),        %[l]        \n"   /* count down length */
+		"jnz     4b                           \n"
+		"                                     \n"
+		"                                     \n"
+		"movq    $1,            %[tmp]        \n"   /* Leave an indicator in len */
+
+		"9:                                   \n"   /* exit */
+		"                                     \n"
+		: [t1]"=r"(t1), [t2]"=r"(t2), [t3]"=r"(t3), [t4]"=r"(t4),
+		  [t5]"=r"(t5), [t6]"=r"(t6), [t7]"=r"(t7), [t8]"=r"(t8),
+		  [tmp]"=r"(tmp),
+		  [src]"+S"(a0), [alias]"+b"(a1), [cache]"+d"(cache),
+		  [dst]"+D"(dst), [l]"+c"(l)
+
+		:
+		: "cc"
+		);
+
+	if (a1) {
+		if (a0)
+			return 1;
+	} 
+	return 0;
+}
 

@@ -73,7 +73,7 @@ extern int td_cmd_gen_SEC_dup(struct td_engine *eng, struct td_token *tok);
  * return 1; return 0 otherwise. */
 extern int td_cmd_status_check(struct td_token *tok);
 extern int td_cmd_ata_ok(td_cmd_t *tdcmd);
-extern int td_cmd_ata_filter(uint8_t *ata_cmd);
+extern int td_cmd_scsi_filter(uint8_t *ata_cmd);
 /** clear deallocation byte from command attached to token */
 extern void td_cmd_clear_deallocation(struct td_token *tok);
 

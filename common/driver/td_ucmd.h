@@ -91,6 +91,7 @@ static inline void td_ucmd_ready(struct td_ucmd *ucmd)
 	ucmd->ioctl.result = -EBUSY;
 }
 
+int td_ucmd_map_virt(struct td_ucmd *ucmd, void* ptr);
 int td_ucmd_map(struct td_ucmd *ucmd,
 		struct task_struct *task, unsigned long addr);
 

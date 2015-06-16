@@ -70,7 +70,6 @@
 #include "td_ucmd.h"
 #include "td_memspace.h"
 #include "td_params.h"
-#include "td_biogrp.h"
 #include "td_eng_mcefree.h"
 
 #ifdef CONFIG_TERADIMM_SGIO
@@ -108,7 +107,8 @@ int td_mapper_check_memory_mapping(const char *dev_name, uint64_t base, uint64_t
 }
 
 
-int td_mapper_init(struct td_mapper *m, const char *dev_name, uint64_t base, uint64_t size)
+int td_mapper_init(struct td_mapper *m, const char *dev_name,
+		uint64_t base, uint64_t size, uint64_t avoid_mask)
 {
 	int rc;
 
@@ -118,6 +118,7 @@ int td_mapper_init(struct td_mapper *m, const char *dev_name, uint64_t base, uin
 
 	m->phys_base = base;
 	m->phys_size = size;
+	m->phys_avoid_mask = avoid_mask;
 
 	rc = td_force_memory_mapping(m);
 	if (rc)
@@ -225,7 +226,7 @@ static inline int teradimm_cache_STATUS(struct td_mapper *m,
 
 	VALIDATE_TYPE_ALIAS_ID(m, STATUS, alias, id);
 
-	off = TERADIMM_OFFSET(STATUS, alias, id);
+	off = TERADIMM_OFFSET(STATUS, alias, id, m->phys_avoid_mask);
 
 #ifdef CONFIG_TERADIMM_STATUS_FROM_LAST_CACHELINE
 	/* status buffers are replicated every 512B */
@@ -246,7 +247,7 @@ static inline int teradimm_cache_EXT_STATUS(struct td_mapper *m,
 
 	VALIDATE_TYPE_ALIAS_ID(m, EXT_STATUS, alias, id);
 
-	off = TERADIMM_OFFSET(EXT_STATUS, alias, id);
+	off = TERADIMM_OFFSET(EXT_STATUS, alias, id, m->phys_avoid_mask);
 
 	VALIDATE_OFFSET(m, EXT_STATUS, alias, id, off);
 
@@ -262,7 +263,7 @@ static inline int teradimm_cache_COMMAND(struct td_mapper *m,
 
 	VALIDATE_TYPE_ALIAS_ID(m, COMMAND, alias, id);
 
-	off = TERADIMM_OFFSET(COMMAND,alias,id);
+	off = TERADIMM_OFFSET(COMMAND,alias,id, m->phys_avoid_mask);
 
 	VALIDATE_OFFSET(m, COMMAND, alias, id, off);
 
@@ -294,7 +295,7 @@ static inline int teradimm_cache_READ_DATA(struct td_mapper *m,
 
 	VALIDATE_TYPE_ALIAS_ID(m, READ_DATA, alias, id);
 
-	off = TERADIMM_OFFSET(READ_DATA,real_alias,id);
+	off = TERADIMM_OFFSET(READ_DATA,real_alias,id,m->phys_avoid_mask);
 
 	VALIDATE_OFFSET(m, READ_DATA, alias, id, off);
 
@@ -313,7 +314,7 @@ static inline int teradimm_cache_READ_META_DATA(struct td_mapper *m,
 
 	VALIDATE_TYPE_ALIAS_ID(m, READ_META_DATA, alias, id);
 
-	off = TERADIMM_OFFSET(READ_META_DATA,real_alias,id);
+	off = TERADIMM_OFFSET(READ_META_DATA,real_alias,id,m->phys_avoid_mask);
 
 #ifdef CONFIG_TERADIMM_RDMETA_FROM_LAST_CACHELINE
 	/* read metadata buffers are replicated every 128B */
@@ -334,7 +335,7 @@ static inline int teradimm_cache_WRITE_DATA(struct td_mapper *m,
 
 	VALIDATE_TYPE_ALIAS_ID(m, WRITE_DATA, alias, id);
 
-	off = TERADIMM_OFFSET(WRITE_DATA,alias,id);
+	off = TERADIMM_OFFSET(WRITE_DATA,alias,id,m->phys_avoid_mask);
 
 	VALIDATE_OFFSET(m, WRITE_DATA, alias, id, off);
 
@@ -350,7 +351,7 @@ static inline int teradimm_cache_WRITE_META_DATA(struct td_mapper *m,
 
 	VALIDATE_TYPE_ALIAS_ID(m, WRITE_META_DATA, alias, id);
 
-	off = TERADIMM_OFFSET(WRITE_META_DATA,alias,id);
+	off = TERADIMM_OFFSET(WRITE_META_DATA,alias,id,m->phys_avoid_mask);
 
 	VALIDATE_OFFSET(m, WRITE_META_DATA, alias, id, off);
 

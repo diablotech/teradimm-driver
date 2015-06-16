@@ -8,3 +8,4 @@ override_dh_auto_configure:
 override_dh_auto_build:
 	make -C tools/tdcmd
 	make -C tools/tdctl
+	make -C tools/tdtst

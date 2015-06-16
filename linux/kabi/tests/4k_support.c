@@ -1,5 +1,4 @@
-#define __KERNEL__
-#include <linux/kconfig.h>
+#include <linux/kernel.h>
 #include <linux/version.h>
 
 #if defined (LINUX_VERSION_CODE)

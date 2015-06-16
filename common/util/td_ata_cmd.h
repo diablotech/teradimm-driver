@@ -118,9 +118,9 @@ enum __packed td_smart_attr_id_val {
 /* Inquiry */
 struct __packed td_inq_cmd {
 	unsigned char op_code;    /* should always be 0x12*/
-	unsigned char _b1_7_02:6; /* reserved */
-	unsigned char _b1_1:1;    /* obsolete */
 	unsigned char evpd:1;     /* extended vpd. */
+	unsigned char _b1_1:1;    /* obsolete */
+	unsigned char _b1_7_02:6; /* reserved */
 	unsigned char page;       /* The requested page code. */
 	uint16_t length;          /* allocation length */
 	unsigned char control;
@@ -131,44 +131,44 @@ struct __packed td_page00 {
 };
 
 struct __packed td_page00r {
-	unsigned char qualifier:3;   /* peripheral qualifier */
 	unsigned char dev_type:5;    /* peripheral device type */
-	unsigned char rmb:1;         /* removable medium */
+	unsigned char qualifier:3;   /* peripheral qualifier */
 	unsigned char _b1_6_0:7;     /* reserved */
+	unsigned char rmb:1;         /* removable medium */
 	unsigned char version;       /* Protocol version */
-	unsigned char _b3_7_6:2;     /* obsolete */
-	unsigned char norm_aca:1;    /* normal aca supported */
-	unsigned char hi_sup:1;      /* hierachical support */
 	unsigned char resp_format:4; /* response format */
+	unsigned char hi_sup:1;      /* hierachical support */
+	unsigned char norm_aca:1;    /* normal aca supported */
+	unsigned char _b3_7_6:2;     /* obsolete */
 	uint8_t size;                /* Remaining length of the struct */
-	unsigned char sccs:1;        /* embedded SCSI storage array controller */
-	unsigned char acc:1;         /* access control coordinator */
-	unsigned char tpgs:2;        /* asymettric logical unit access*/
-	unsigned char _3pc:1;        /* 3rd party copy */
-	unsigned char _b5_2_1:2;     /* reserved */
 	unsigned char protect:1;     /* support for protection information */
-	unsigned char bque:1;        /* with cmd_que, full task management support */
-	unsigned char enc_serv:1;    /* enclosuyre services */
-	unsigned char vs1:1;
-	unsigned char multi_p:1;     /* multi-port */
-	unsigned char mchngr:1;      /* medium changer */
-	unsigned char _b6_2_1:2;     /* obsolete */
+	unsigned char _b5_2_1:2;     /* reserved */
+	unsigned char _3pc:1;        /* 3rd party copy */
+	unsigned char tpgs:2;        /* asymettric logical unit access*/
+	unsigned char acc:1;         /* access control coordinator */
+	unsigned char sccs:1;        /* embedded SCSI storage array controller */
 	unsigned char addr16:1;      /* 16-bit wide SCSI addresses */
-	unsigned char _b6_7_6:2;     /* obsolete */
-	unsigned char wbus16:1;      /* 16-bit wide SCSI transfers */
-	unsigned char sync:1;        /* synchronous transfer */
-	unsigned char linked:1;      /* linked command support */
-	unsigned char _b7_2:1;       /* obsolete */
-	unsigned char cmd_que:1;     /* with bque, fuull task management support */
+	unsigned char _b6_2_1:2;     /* obsolete */
+	unsigned char mchngr:1;      /* medium changer */
+	unsigned char multi_p:1;     /* multi-port */
+	unsigned char vs1:1;
+	unsigned char enc_serv:1;    /* enclosuyre services */
+	unsigned char bque:1;        /* with cmd_que, full task management support */
 	unsigned char vs2:1;
+	unsigned char cmd_que:1;     /* with bque, fuull task management support */
+	unsigned char _b7_2:1;       /* obsolete */
+	unsigned char linked:1;      /* linked command support */
+	unsigned char sync:1;        /* synchronous transfer */
+	unsigned char wbus16:1;      /* 16-bit wide SCSI transfers */
+	unsigned char _b6_7_6:2;     /* obsolete */
 	char t10[8];                 /* t10 vendor */
 	char pid[16];                /* product id */
 	char rev[4];                 /* product revision */
 	char vendor[20];             /* vendor specific */
-	unsigned char _b56_7_4:4;    /* reserved */
-	unsigned char clk:2;         /* clocking */
-	unsigned char qas:1;         /*  */
 	unsigned char ius:1;         /* */
+	unsigned char qas:1;         /*  */
+	unsigned char clk:2;         /* clocking */
+	unsigned char _b56_7_4:4;    /* reserved */
 	uint16_t ver1;               /* Version descriptor 1 */
 	uint16_t ver2;               /* Version descriptor 2 */
 	uint16_t ver3;               /* Version descriptor 3 */
@@ -664,29 +664,6 @@ union __packed td_smart_page {
 	td_smart_log_t log;
 };
 typedef union td_smart_page td_smart_page_t;
-
-#ifdef CONFIG_TERADIMM_SGIO
-struct __packed td_dev_ata_state {
-	struct td_engine *eng;
-	sg_io_hdr_t *hdr;
-	struct td_ioctl_device_ssd_pt *pt_cmd;
-	union {
-		uint8_t *ata;
-		struct td_ata_pt_cmd *ata_pt_cmd;
-	};
-	uint8_t cmd;
-	union {
-		void *p_resp;
-		struct td_ata_pt_resp *resp;
-	};
-	td_ata_inq_resp_t *answer;
-	uint16_t pg_cnt;
-	int data_to_device;
-	int data_from_device;
-	uint8_t log_addr;
-
-};
-#endif
 
 static inline uint8_t td_ata16_chksum(void *ata) {
 	uint8_t ret;

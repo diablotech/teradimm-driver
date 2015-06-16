@@ -88,8 +88,9 @@ tools.deb: src.deb teradimm_$(TERADIMM_VERSION).orig.tar.gz
 	touch debian/copyright
 	cp rules.tools debian/rules
 	echo "3.0 (quilt)" > debian/source/format
-	echo "tools/tdcmd/tdcmd /usr/sbin/tdcmd" > debian/install
-	echo "tools/tdctl/tdctl /usr/sbin/tdctl" >> debian/install
+	echo "tools/tdcmd/tdcmd /usr/sbin" > debian/install
+	echo "tools/tdctl/tdctl /usr/sbin" >> debian/install
+	echo "tools/tdtst/tdtst /usr/sbin" >> debian/install
 	mv debian teradimm_$(TERADIMM_VERSION)
 	cd teradimm_$(TERADIMM_VERSION);debuild -uc -us
 

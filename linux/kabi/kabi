@@ -1,53 +1,55 @@
 #!/bin/bash
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-#     Copyright (c) 2013 Diablo Technologies Inc. ("DIABLO").  All      #
-#     rights reserved.                                                  #
 #                                                                       #
-#     This software is being licensed under a dual license, at Diablo's #
-#     sole discretion.                                                  #
+#    Copyright (c) 2013 Diablo Technologies Inc. ("DIABLO").  All       #
+#    rights reserved.                                                   #
 #                                                                       #
-#     GPL License                                                       #
+#    This software is being licensed under a dual license, at Diablo's  #
+#    sole discretion.                                                   #
 #                                                                       #
-#     If you do not have explicit permission from Diablo, then you may  #
-#     only redistribute it and/or modify it under the terms of the GNU  #
-#     General Public License as published by the Free Software          #
-#     Foundation; either version 2 of the License, or (at your option)  #
-#     any later version located at <http://www.gnu.org/licenses/>.  See #
-#     the GNU General Public License for more details.                  #
+#    GPL License                                                        #
 #                                                                       #
-#     BSD License                                                       #
+#    If you do not have explicit permission from Diablo, then you may   #
+#    only redistribute it and/or modify it under the terms of the GNU   #
+#    General Public License as published by the Free Software           #
+#    Foundation; either version 2 of the License, or (at your option)   #
+#    any later version located at <http://www.gnu.org/licenses/>.  See  #
+#    the GNU General Public License for more details.                   #
 #                                                                       #
-#     If you have explicit permission from Diablo, then redistribution  #
-#     and use in source and binary forms, with or without modification, #
-#     are permitted provided that the following conditions are met:     #
+#    BSD License                                                        #
 #                                                                       #
-#         * Redistributions of source code must retain the above        #
-#         copyright notice, this list of conditions and the following   #
-#         disclaimer.                                                   #
+#    If you have explicit permission from Diablo, then redistribution   #
+#    and use in source and binary forms, with or without modification,  #
+#    are permitted provided that the following conditions are met:      #
 #                                                                       #
-#         * Redistributions in binary form must reproduce the above     #
-#         copyright notice, this list of conditions and the following   #
-#         disclaimer in the documentation and/or other materials        #
-#         provided with the distribution.                               #
+#        * Redistributions of source code must retain the above         #
+#        copyright notice, this list of conditions and the following    #
+#        disclaimer.                                                    #
 #                                                                       #
-#         * Neither the name of the DIABLO nor the names of its         #
-#         contributors may be used to endorse or promote products       #
-#         derived from this software without specific prior written     #
-#         permission.                                                   #
+#        * Redistributions in binary form must reproduce the above      #
+#        copyright notice, this list of conditions and the following    #
+#        disclaimer in the documentation and/or other materials         #
+#        provided with the distribution.                                #
 #                                                                       #
-#     THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND            #
-#     CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,       #
-#     INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF          #
-#     MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE          #
-#     DISCLAIMED. IN NO EVENT SHALL DIABLO BE LIABLE FOR ANY DIRECT,    #
-#     INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL        #
-#     DAMAGES(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE  #
-#     GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS     #
-#     INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,      #
-#     WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT(INCLUDING          #
-#     NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF     #
-#     THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. #
+#        * Neither the name of the DIABLO nor the names of its          #
+#        contributors may be used to endorse or promote products        #
+#        derived from this software without specific prior written      #
+#        permission.                                                    #
+#                                                                       #
+#    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND             #
+#    CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,        #
+#    INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF           #
+#    MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE           #
+#    DISCLAIMED. IN NO EVENT SHALL DIABLO BE LIABLE FOR ANY DIRECT,     #
+#    INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL         #
+#    DAMAGES(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE   #
+#    GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS      #
+#    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,       #
+#    WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT(INCLUDING           #
+#    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS #
+#    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.       #
+#                                                                       #
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 set -e
@@ -93,50 +95,18 @@ runtest() {
         checktest "$name"
 
         mkdir -p "$TMPDIR"
+
         tmpout="$TMPDIR/$name"
         rm -f "$tmpout"*
-
-	if [ -z $LINUX_PATH ]; then
-	        declare -a opts=(
-        	        -Os
-                	-isystem "$KERN/include"
-			-isystem "$KERN/include/uapi"
-			-isystem "$ARCH_PATH/include/generated"
-	                -I "$ARCH_PATH/include"
-                	-Wall -Werror
-	                -Werror-implicit-function-declaration
-                        -D"KBUILD_BASENAME="
-        	)
-	else
-	        declare -a opts=(
-        	        -Os
-                	-isystem "$KERN/include"
-			-isystem "$KERN/include/uapi"
-			-isystem "$ARCH_PATH/include/generated"
-	                -I "$ARCH_PATH/include"
-        	        -I "$LINUX_PATH/include"
-                	-Wall -Werror
-	                -Werror-implicit-function-declaration
-                        -fno-strict-aliasing
-        	)
-	fi
-
-        if [[ ! -e "$KERN/include/linux/kconfig.h" ]];then
-                opts=( ${opts[*]} -I "$TESTDIR" )
-        fi
-
-        declare -a autoconf_locations=(
-                linux/autoconf.h
-                generated/autoconf.h
-        )
-        for n in ${autoconf_locations[*]} ; do
-                [ -f "$KERN/include/$n" ] && opts=( ${opts[*]} -include $n )
-        done
+        
 
         (
                 set -x
-                gcc ${opts[*]} -o "$tmpout.E.c" -E "$TESTDIR/$1.c"
-                gcc ${opts[*]} -o "$tmpout.o"   -c "$TESTDIR/$1.c"
+                echo "# $1" > $TMPDIR/Makefile
+                ln -s "$TESTDIR/$1.c" "$TMPDIR/"
+                make -C $KERN M=$TMPDIR V=1 $1.o KCFLAGS=-Werror
+                #gcc ${opts[*]} -o "$tmpout.E.c" -E "$TESTDIR/$1.c"
+                #gcc ${opts[*]} -o "$tmpout.o"   -c "$TESTDIR/$1.c"
 
         ) > "$tmpout.log" 2>&1
 
@@ -242,19 +212,6 @@ fi
 [ -f "$KERN"/include/linux/version.h -o \
   -f "$KERN"/include/generated/uapi/linux/version.h ] || die "$KERN: not a linux kernel build tree"
 
-if [ -d "${KERN/build/}/source/arch/$ARCH" ]; then
-	ARCH_PATH=${KERN/build/}/source/arch/$ARCH
-	LINUX_PATH=${KERN/build/}/source
-elif [ -d "$KERN/arch/$ARCH" ]; then
-	ARCH_PATH=$KERN/arch/$ARCH
-elif [ -d "$KERN/arch/$ARCH"_64 ]; then
-        ARCH=x86_64
-        ARCH_PATH=$KERN/arch/$ARCH
-
-fi
-
-[ ! -z $ARCH_PATH ] || die "$ARCH: does not seem to be a valid architecture"
-
 if [ -f ${KERN}/.kernelvariables ]; then
         KVER=$(awk '/override KERNELRELEASE = / { print $4 }' ${KERN}/.kernelvariables)
 elif [ -f ${KERN}/include/config/kernel.release ]; then
@@ -264,7 +221,7 @@ else
 fi
 [ -z "$KVER" ] && die "cannot discern kernel version"
 
-[ -z "$TMPDIR" ] && TMPDIR="tmp/$KVER"
+[ -z "$TMPDIR" ] && TMPDIR="$PWD/tmp/$KVER"
 
 if $getversion ; then
         echo $KVER
@@ -283,7 +240,7 @@ elif $generate ; then
         for n in $(testnames) ; do
                 sym=$(testname2sym "$n")
                 if runtest $n ; then
-                        echo "#define ${sym/=/ }"
+                        echo "#define ${sym/_DEFINE_/ }"
                 fi
         done
         echo

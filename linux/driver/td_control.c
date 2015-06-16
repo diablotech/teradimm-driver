@@ -501,6 +501,7 @@ static long td_control_ioctl(struct file *filp, unsigned int cmd,
 				k_arg->dev_create.phys_slot_name,
 				k_arg->dev_create.phys_mem_base,
 				k_arg->dev_create.phys_mem_size,
+				k_arg->dev_create.phys_mem_avoid_mask,
 				k_arg->dev_create.irq_num,
 				k_arg->dev_create.memspeed,
 				k_arg->dev_create.cpu_socket);
@@ -550,7 +551,6 @@ static long td_control_ioctl(struct file *filp, unsigned int cmd,
 			rc = 0;
 		}
 		break;
-		
 	default:
 		rc = -ENOIOCTLCMD;
 		break;
@@ -647,6 +647,7 @@ static int td_ioctl_devgroup_get_counters(struct td_ioctl_devgroup_counters *cnt
 	struct td_devgroup *dg;
 	struct td_work_node *wn;
 	struct td_worker *w;
+	struct td_ioctl_counter_entry *ent;
 
 	rc = -ENOENT;
 	dg = td_devgroup_get_by_name(cntrs->group_name);
@@ -656,8 +657,9 @@ static int td_ioctl_devgroup_get_counters(struct td_ioctl_devgroup_counters *cnt
 	wn = &(dg->dg_work_node);
 
 	/* determine the total number of static & dynamic counters */
-	i = TD_DEVGROUP_ENDIO_COUNT_MAX + \
-		(wn->wn_worker_count * TD_DEVGROUP_WORKER_COUNT_MAX);
+	i = TD_DEVGROUP_ENDIO_COUNT_MAX
+		+ TD_DEVGROUP_NODE_COUNT_MAX
+		+ (wn->wn_worker_count * TD_DEVGROUP_WORKER_COUNT_MAX);
 
 	if (cntrs->count < i) {
 		/* the user buffer isn't big enough, return the count required */
@@ -668,13 +670,29 @@ static int td_ioctl_devgroup_get_counters(struct td_ioctl_devgroup_counters *cnt
 
 	cntrs->count = 0; /* increase the count in loop body */
 
-	/* fill the static counters */
+	/* fill the endio counters */
 	for (i = 0 ; i < TD_DEVGROUP_ENDIO_COUNT_MAX ; i++, cntrs->count++) {
-		cntrs->entries[cntrs->count].type = TD_DEVGROUP_COUNTER_ENDIO;
-		cntrs->entries[cntrs->count].var = cntrs->count;
-		rc = td_devgroup_get_counter(dg, NULL, cntrs->entries[cntrs->count].type,
-			cntrs->entries[cntrs->count].var,
-			&cntrs->entries[cntrs->count].val);
+		ent = cntrs->entries + cntrs->count;
+
+		ent->type = TD_DEVGROUP_COUNTER_ENDIO;
+		ent->var = i;
+		rc = td_devgroup_get_counter(dg, NULL, ent->type,
+			ent->var, &ent->val);
+
+		if (rc == -ENOENT)
+			continue;
+		if (rc)
+			goto error;
+	}
+
+	/* fill the node counters */
+	for (i = 0 ; i < TD_DEVGROUP_NODE_COUNT_MAX ; i++, cntrs->count++) {
+		ent = cntrs->entries + cntrs->count;
+
+		ent->type = TD_DEVGROUP_COUNTER_NODE;
+		ent->var = i;
+		rc = td_devgroup_get_counter(dg, NULL, ent->type,
+			ent->var, &ent->val);
 
 		if (rc == -ENOENT)
 			continue;
@@ -685,13 +703,14 @@ static int td_ioctl_devgroup_get_counters(struct td_ioctl_devgroup_counters *cnt
 	/* fill the dynamic counters */
 	for (i = 0 ; i < TD_DEVGROUP_WORKER_COUNT_MAX ; i++) {
 		for (j = 0 ; j < wn->wn_worker_count ; j++, cntrs->count++) {
+			ent = cntrs->entries + cntrs->count;
+
 			w = (wn->wn_workers + j);
-			cntrs->entries[cntrs->count].type = TD_DEVGROUP_COUNTER_WORKER;
-			cntrs->entries[cntrs->count].worker = w->w_cpu;
-			cntrs->entries[cntrs->count].var = i;
-			rc = td_devgroup_get_counter(dg, w, cntrs->entries[cntrs->count].type,
-				cntrs->entries[cntrs->count].var,
-				&cntrs->entries[cntrs->count].val);
+			ent->type = TD_DEVGROUP_COUNTER_WORKER;
+			ent->part.var = i;
+			ent->part.id = w->w_cpu;
+			rc = td_devgroup_get_counter(dg, w, ent->type,
+				ent->part.var, &ent->val);
 
 			if (rc == -ENOENT)
 				continue;
@@ -797,6 +816,9 @@ static int td_ioctl_devgroup_set_conf(struct td_ioctl_devgroup_conf *conf)
 		if (rc)
 			break;
 	}
+
+	/* poke the devgroup to allow it to react to the new configuration */
+	td_devgroup_poke(dg);
 
 error_devgroup_stop:
 	td_devgroup_put(dg);

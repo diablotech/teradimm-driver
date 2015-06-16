@@ -227,6 +227,8 @@ const struct td_conf_var_desc td_eng_conf_var_desc[TD_CONF_REGS_MAX] = {
 
 	TD_CONF_ENTRY(INCOMING_SLEEP,              always,    0,  10000)
 	TD_CONF_ENTRY(INCOMING_WAKE,               always,    0,  10000)
+
+	TD_CONF_ENTRY(USE_READ_ALIASES,            always,    0,  3)
 };
 
 /* WINDOWS NEEDS THESE IN ORDER OF ENUMS IN td_defs.h */
@@ -277,11 +279,14 @@ const struct td_conf_var_desc td_eng_conf_mcefree_var_desc[TD_CONF_MCEFREE_REGS_
 
 	TD_CONF_MCEFREE_ENTRY(FWSTATUS_HOLD_NSEC,      always, 0,    100000)
 
-	TD_CONF_MCEFREE_ENTRY(STATUS_R2P_MIN_NSEC,     always, 1,      5000)
+	TD_CONF_MCEFREE_ENTRY(STATUS_R2P_MIN_NSEC,     always, 1,     10000)
 	TD_CONF_MCEFREE_ENTRY(STATUS_R2P_MAX_NSEC,     always, 1000,  25000)
 	TD_CONF_MCEFREE_ENTRY(STATUS_R2P_CLIMB_NSEC,   always, 1,      1000)
-	TD_CONF_MCEFREE_ENTRY(STATUS_R2P_DROP_NSEC,    always, 1,        10)
-	TD_CONF_MCEFREE_ENTRY(STATUS_R2P_COOL_MSEC,    always, 0,        40)
+	TD_CONF_MCEFREE_ENTRY(STATUS_R2P_DROP_NSEC,    always, 1,      1000)
+	TD_CONF_MCEFREE_ENTRY(STATUS_R2P_COOL_MSEC,    always, 0,       100)
+
+	TD_CONF_MCEFREE_ENTRY(STATUS_REQ_FLUSH,        always, 0,         1) // off/on
+	TD_CONF_MCEFREE_ENTRY(RDMETA_FLUSH,            always, 0,         2) // off/clflush/uc-read
 };
 #endif
 
@@ -433,6 +438,8 @@ void td_eng_conf_init(struct td_engine *eng, struct td_eng_conf *conf)
 #if CONFIG_TERADIMM_INCOMING_BACKPRESSURE == TD_BACKPRESSURE_EVENT
 	td_eng_conf_var_set(eng, INCOMING_WAKE, 250);
 #endif
+
+	td_eng_conf_var_set(eng, USE_READ_ALIASES, 0); /* disable read buffer aliasing */
 }
 
 

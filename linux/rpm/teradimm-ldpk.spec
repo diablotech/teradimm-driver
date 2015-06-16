@@ -13,7 +13,7 @@ BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 %endif
 
 %if "%{?tools}" != "none"
- %define tools  tdctl tdcmd
+ %define tools tdctl tdtst tdcmd
 %endif
 
 # If kversion isn't defined on the rpmbuild line, define it here.

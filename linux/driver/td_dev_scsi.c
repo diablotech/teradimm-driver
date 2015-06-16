@@ -50,119 +50,174 @@
  *                                                                       *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#ifndef _TD_BIO_H_
-#define _TD_BIO_H_
 
-/*
- * The intent of this file is to make it easy to implement wrappers around
- * any OS native block request structures
- */
 
-#include "td_kdefn.h"
-
-#include "td_defs.h"
+#include "td_device.h"
+#include "td_ioctl.h"
+#include "td_engine.h"
 #include "td_compat.h"
-/* Pre-declare this, for the endio function argument */
-struct td_engine;
+#include "td_ucmd.h"
+#include "td_ata_cmd.h"
+#include "td_command.h"
+#include "td_devgroup.h"
+#include "td_eng_hal.h"
+#include "td_ata_cmd.h"
+#include "td_params.h"
+#include "td_dev_scsi.h"
+#include "td_dev_ata.h"
 
-/*
- * These are the forward declarations of BIO stuff that needs
- * to be supported by all the platforms
- */
-typedef struct bio td_bio_t;
-typedef struct bio * td_bio_ref;
-
-/*
- * This is the BIO API that the engine uses:
- *  - Get/set byte/sector info
- *  - Get/set flags
- *  - end BIO
- */
-static inline unsigned int td_bio_get_byte_size(td_bio_ref ref);
-static inline void         td_bio_set_byte_size(td_bio_ref ref, unsigned size);
-
-static inline uint64_t td_bio_get_sector_offset(td_bio_ref ref);
-static inline void     td_bio_set_sector_offset(td_bio_ref ref, uint64_t s);
-
-static inline int td_bio_is_sync(td_bio_ref ref);
-static inline int td_bio_is_discard(td_bio_ref ref);
-static inline int td_bio_is_write(td_bio_ref ref);
-
-static inline int td_bio_is_read(td_bio_ref ref)
+static int td_scsi_cmd_ata12_pass(struct td_scsi_cmd *cmd)
 {
-	return ! td_bio_is_write(ref);
+	int rc = 0;
+	struct td_ata_pt_cmd *ata_pt_cmd = (struct td_ata_pt_cmd *)cmd->request;
+
+	switch(ata_pt_cmd->p12.cmd) {
+	case ATA_CMD_ID_ATA:
+		rc = td_dev_ata_ident(cmd);
+		break;
+	default:
+		printk("Error ATA12 pass cmd %02X unknown\n", ata_pt_cmd->p12.cmd);
+		rc = -EINVAL;
+		break;
+	}
+
+	return rc;
 }
 
-
-/*
- * These are few "flags" that we need to keep with BIOs
- */
-static inline enum td_commit_type td_bio_flags_get_commitlevel (td_bio_ref ref);
-static inline void                td_bio_flags_set_commitlevel (td_bio_ref ref, enum td_commit_type cl);
-
-static inline int td_bio_is_part(td_bio_ref ref);
-
-/*
- * The main "bio endio" function
- */
-extern void td_bio_endio(struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts);
-
-/* This is a support function in td_trim.c */
-extern int td_bio_trim_count(td_bio_ref bio, struct td_engine *eng);
-
-/*
- * BIOGRP API
- * 
- * This is the API that the RAID code relies on for bio groups
- * BIO Groups are created by the OS-specific block layer front-ends, and the
- * member BIOs of them are submitted to the device engines.
- *
- * The OS can implement the bio groups as it sees fit.  The raid code only needs
- * a common entry point to "create" the groupings, and a way to get the
- * failure of a part back from the BIOGRP code when a chunk fails.
- *
- * The bio part failure back information needs to get back into the raid code
- * so the raid can handle errors appropriately.
- *
- * The error_part function returns an INT.  A return value of 0 means that
- * the failure was over-ruled.  No further processing can happen, because the
- * error handler did something special with that part.  It as arranged that
- * the part will be finished again at some other time.
- * A return value of non-zero means to complete the part, with the returned
- * value as the result to use for the td_biogrp.
- */
-
-struct td_biogrp;
-
-struct td_biogrp_options
+static int td_scsi_cmd_ata16_pass(struct td_scsi_cmd *cmd)
 {
-	unsigned        split_size;
-	unsigned        duplicate_count;
-	void            (*submit_part) (struct td_biogrp *grp,
-					td_bio_ref bio, void* opaque);
-	int             (*error_part) (struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts);
-};
+	int rc = 0;
+	int data_from_device;
+	int data_to_device;
 
-extern int td_biogrp_create (td_bio_ref obio, struct td_biogrp_options *ops,
-		void* opaque);
+	struct td_ata_pt_cmd *ata_pt_cmd = (struct td_ata_pt_cmd *)cmd->request;
 
+	switch(ata_pt_cmd->p16.cmd) {
+	case ATA_CMD_ID_ATA:
+		rc = td_dev_ata_ident(cmd);
+		break;
+	case ATA_CMD_SMART:
+		rc = td_dev_ata16_smart(cmd);
+		break;
+	case ATA_CMD_SEC_ERASE_PREP:
+	case ATA_CMD_SEC_ERASE_UNIT:
+		rc = td_dev_ata16_security(cmd);
+		break;
+	case 0x2F:
+		printk("Retrieve log treated as generic\n");
+		data_from_device = 512;
+		data_to_device = 0;
+		rc = td_dev_ata16_generic(cmd, data_from_device, data_to_device);
+		break;
+	default:
+		printk("Error ATA16 pass cmd %02X unknown\n", ata_pt_cmd->p16.cmd);
+		rc = -EINVAL;
+		break;
+	}
 
+	return rc;
+}
 
-#ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
-/*
- * If we are offloading successful endio, this is how the devgroup code
- * calls it
- */
-static inline void td_bio_complete_success (td_bio_ref bio);
-#endif
+static int td_scsi_cmd_inquiry(struct td_scsi_cmd *cmd)
+{
+	struct td_inq_cmd *inq = (struct td_inq_cmd *)cmd->request;
+	td_ata_inq_resp_t *response = (td_ata_inq_resp_t *)cmd->dxferp;
+	struct td_page00r *page00r = &response->page00r;
+	unsigned char *sb = cmd->sense;
+	int rc = 0;
 
-#include "td_bio_linux.h"
+	/* check that return buffer can hold a standard INQUIRY response */
+	if (cmd->dxfer_len < 36) { /* SPC-4 */
+		rc = -EINVAL;
+		goto too_small;
+	}
 
+	/* handle only standard inquiry */
+	if ((inq->_b1_1) || (inq->evpd)) {
+		sb[0] = 0x70; /* error code */
+		sb[2] = ILLEGAL_REQUEST;
+		sb[7] = 0xa; /* additional sense length */
+		sb[12] = 0x24; /* INVALID FIELD IN CDB */
 
+		cmd->sense_len = 18;
+		cmd->status = SAM_STAT_CHECK_CONDITION;
+		rc = DRIVER_SENSE;
 
-#ifndef KABI__bio_list
-#include "lk_biolist.h"
-#endif
+		goto error;
+	}
 
-#endif
+	memset(page00r, 0, sizeof(*page00r));
 
+	/* direct access block device */
+	page00r->dev_type = 0x0;
+
+	/* connected */
+	page00r->qualifier = 0x0;
+
+	/* claim SPC-4 conformance */
+	page00r->version = 0x6;
+
+	/* response format complies to SPC-4 standard */
+	page00r->resp_format = 0x2;
+
+	/* response length count does not include header size */
+	page00r->size = cmd->dxfer_len - 5; /* FIXME: set this more manually */
+
+	/* T10 vendor identification */
+	memcpy(page00r->t10, cmd->odev->vendor, sizeof(cmd->odev->vendor) - 1);
+
+	/* product identification */
+	memcpy(page00r->pid, cmd->odev->model, sizeof(cmd->odev->model) - 1);
+
+	/* product revision level */
+	memcpy(page00r->rev, cmd->odev->revision, sizeof(cmd->odev->revision) - 1);
+
+	cmd->status = SAM_STAT_GOOD;
+	cmd->resid = cmd->dxfer_len - 36;
+
+too_small:
+error:
+	return rc;
+}
+
+int td_osdev_scsi_command(struct td_scsi_cmd *cmd)
+{
+	int rc = -EINVAL;
+
+	switch (*cmd->request) {
+	case ATA_16:
+	{
+		rc = td_scsi_cmd_ata16_pass(cmd);
+
+		break;
+	}
+	case ATA_12:
+	{
+		rc = td_scsi_cmd_ata12_pass(cmd);
+
+		break;
+	}
+	case INQUIRY:
+	{
+		rc = td_scsi_cmd_inquiry(cmd);
+
+		break;
+	}
+	default:
+	{
+		unsigned char *sb = cmd->sense;
+		sb[0] = 0x70; /* error code */
+		sb[2] = ILLEGAL_REQUEST;
+		sb[7] = 0xa; /* additional sense length */
+		sb[12] = 0x20; /* ILLEGAL COMMAND */
+
+		cmd->sense_len = 18;
+		cmd->status = SAM_STAT_CHECK_CONDITION;
+		rc = DRIVER_SENSE;
+
+		break;
+	}
+	}
+
+	return rc;
+}

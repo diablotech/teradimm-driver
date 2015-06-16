@@ -65,12 +65,18 @@ static int td_scan_y = 1;
 module_param_named(scan_x, td_scan_x, uint, 0444);
 module_param_named(scan_y, td_scan_y, uint, 0444);
 
+static int scan_socket = 0;
+static int scan_socket_count = 0;
+static int scan_socket_max = 0;
+
+/* This hooks in to tell workers how many dev/node */
+extern uint td_workers_per_node;
+
 #ifndef KABI__acpi_tables
 
 #define ACPI_NAME_SIZE		  4
 #define ACPI_OEM_ID_SIZE	  6
 #define ACPI_OEM_TABLE_ID_SIZE	  8
-
 
 struct acpi20_table_rsdp {
 	char signature[8];      /* ACPI signature, contains "RSD PTR " */
@@ -210,7 +216,7 @@ static int process_flshdimm (struct acpi_table_header *acpi,
 	    dev_info = kmalloc(TD_DISCOVERED_INFO_SIZE(0), GFP_KERNEL);
 	    dev_info->done = td_bios_discovered_done;
 
-	    dev_info->source = "IBM FLSHDIMM";
+	    dev_info->source = "Lenovo FLSHDIMM";
 
 	    dev_info->mem_base = ibm->base_high;
 	    dev_info->mem_base <<= 32;
@@ -219,6 +225,9 @@ static int process_flshdimm (struct acpi_table_header *acpi,
 	    dev_info->mem_size = ibm->length_high;
 	    dev_info->mem_size <<= 32;
 	    dev_info->mem_size |= ibm->length_low;
+
+	    /* unused in this ACPI table revision */
+	    dev_info->mem_avoid_mask = 0x0;
 
 	    dev_info->socket = ibm->socket;
 	    dev_info->agent = ibm->agent;
@@ -246,15 +255,53 @@ static int process_flshdimm (struct acpi_table_header *acpi,
 }
 #endif
 
+/*******************************************************************************
+ *
+ * MCS-DIMM OEM ACPI TABLE COMMON
+ *
+ ******************************************************************************/
+
 #define MCS_DIMM_ACPI_HEADER_SIZE               48
-#define MCS_DIMM_RESOURCE_HEADER_SIZE           48
 
 #define MCS_DIMM_STATUS_DNE                     0x00
 #define MCS_DIMM_STATUS_DISABLED                0x01
 #define MCS_DIMM_STATUS_OK                      0x80
 #define MCS_DIMM_STATUS_NOT_TRAINED             0x82
 
-struct __packed mcs_dimm_resource {
+static int process_mcs_issue(uint8_t status, char *locator_string)
+{
+	int ret = 1;
+
+	switch(status) {
+	case MCS_DIMM_STATUS_DNE:
+		/* Does not exist.
+		 * There's no device, but there's an empty entry. */
+		break;
+	case MCS_DIMM_STATUS_DISABLED:
+		pr_err("MCS DIMM in slot %s is disabled!\n",
+				locator_string);
+		break;
+	case MCS_DIMM_STATUS_NOT_TRAINED:
+		pr_warn("MCS DIMM in slot %s is not trained\n",
+				locator_string);
+		ret = 0;
+		break;
+	default:
+		break;
+	}
+
+	return ret;
+}
+
+/*******************************************************************************
+ *
+ * MCS-DIMM OEM ACPI TABLE REVISION 1
+ *
+ ******************************************************************************/
+
+#define MCS_DIMM_RESOURCE_HEADER_SIZE_V1        48
+
+struct __packed mcs_dimm_resource_v1 {
 	uint8_t         reserved;   // Should be 0
 	uint8_t         length;
 	uint8_t         spd_type;
@@ -278,44 +325,19 @@ struct __packed mcs_dimm_resource {
 	char            locator_string[0];
 };
 
-static int process_mcs_issue(struct mcs_dimm_resource *mcs)
-{
-	int ret = 1;
-
-	switch(mcs->status) {
-	case MCS_DIMM_STATUS_DNE:
-		/* Does not exist.
-		 * There's no device, but there's an empty entry. */
-		break;
-	case MCS_DIMM_STATUS_DISABLED:
-		pr_err("MCS DIMM in slot %s is disabled!\n",
-				mcs->locator_string);
-		break;
-	case MCS_DIMM_STATUS_NOT_TRAINED:
-		pr_warn("MCS DIMM in slot %s is not trained\n",
-				mcs->locator_string);
-		ret = 0;
-		break;
-	default:
-		break;
-	}
-
-	return ret;
-}
-
-static int process_mcs_dimm (struct acpi_table_header *acpi,
+static int process_mcs_dimm_v1 (struct acpi_table_header *acpi,
 		td_scan_callback_t cb_func, void *data)
 {
 	int cork = 0;
 	int i = 0, c;
 	unsigned int length = acpi->length;
 	unsigned int offset = MCS_DIMM_ACPI_HEADER_SIZE;
-	
+
 	while (offset < length) {
-	    struct mcs_dimm_resource *mcs = PTR_OFS(acpi, offset);
+	    struct mcs_dimm_resource_v1 *mcs = PTR_OFS(acpi, offset);
 	    struct td_discovered_info *dev_info;
 
-	    if (mcs->length < MCS_DIMM_RESOURCE_HEADER_SIZE) {
+	    if (mcs->length < MCS_DIMM_RESOURCE_HEADER_SIZE_V1) {
 		    pr_err("MCS DIMM Entry invalid: length == 0 at offset 0x%x\n",
 				    offset);
 		    pr_err(" - acpi = 0x%p (%lu)\n", acpi, sizeof(*acpi));
@@ -325,7 +347,7 @@ static int process_mcs_dimm (struct acpi_table_header *acpi,
 		    for (i = 0; i < acpi->length/16; i++)
 			dump_memory("ACPI: ", PTR_OFS(acpi, i*16), 16);
 
-		    dump_memory("MCS: ", mcs, MCS_DIMM_RESOURCE_HEADER_SIZE);
+		    dump_memory("MCS: ", mcs, MCS_DIMM_RESOURCE_HEADER_SIZE_V1);
 		    break;
 	    }
 
@@ -336,7 +358,7 @@ static int process_mcs_dimm (struct acpi_table_header *acpi,
 	    if (cork++ > 256)
 		    break;
 
-	    if(mcs->status != MCS_DIMM_STATUS_OK && process_mcs_issue(mcs))
+	    if(mcs->status != MCS_DIMM_STATUS_OK && process_mcs_issue(mcs->status, mcs->locator_string))
 			    goto skip_dev;
 
 	    dev_info = kmalloc(TD_DISCOVERED_INFO_SIZE(16), GFP_KERNEL);
@@ -349,6 +371,9 @@ static int process_mcs_dimm (struct acpi_table_header *acpi,
 
 	    dev_info->mem_base = mcs->mem_base;
 	    dev_info->mem_size = mcs->mem_size;
+
+	    /* unused in this ACPI table revision */
+	    dev_info->mem_avoid_mask = 0x0;
 
 	    dev_info->socket = mcs->socket;
 	    dev_info->agent = mcs->agent;
@@ -364,6 +389,15 @@ static int process_mcs_dimm (struct acpi_table_header *acpi,
 		    dev_info->spd[c].idx = 158+c;
 		    dev_info->spd[c].val = mcs->spd_158_173[c];
 	    }
+
+	    if (dev_info->socket == scan_socket) {
+		    scan_socket_count++;
+	    } else {
+		    scan_socket = dev_info->socket;
+		    scan_socket_count = 1;
+	    }
+	    if (scan_socket_count > scan_socket_max)
+		    scan_socket_max = scan_socket_count;
 
 	    if (cb_func && (i % td_scan_x) < td_scan_y)
 		cb_func(dev_info, data);
@@ -382,10 +416,139 @@ skip_dev:
 	return 0;
 }
 
+/*******************************************************************************
+ *
+ * MCS-DIMM OEM ACPI TABLE REVISION 2
+ *
+ ******************************************************************************/
+
+#define MCS_DIMM_RESOURCE_HEADER_SIZE_V2        56
+
+struct __packed mcs_dimm_resource_v2 {
+	uint8_t         reserved;   // Should be 0
+	uint8_t         length;
+	uint8_t         spd_type;
+	uint8_t         spd_asic;
+
+	uint8_t         slot;
+	uint8_t         channel;
+	uint8_t         agent;
+	uint8_t         socket;
+
+	uint64_t        mem_base;
+	uint64_t        mem_size;
+	uint64_t        mem_avoid_mask;
+
+	uint32_t        reserved2;
+
+	uint16_t        mem_speed;
+	uint8_t         status;
+	uint8_t         reserved3;
+
+	uint8_t         spd_158_173[16];
+	char            locator_string[0];
+};
+
+static int process_mcs_dimm_v2 (struct acpi_table_header *acpi,
+		td_scan_callback_t cb_func, void *data)
+{
+	int cork = 0;
+	int i = 0, c;
+	unsigned int length = acpi->length;
+	unsigned int offset = MCS_DIMM_ACPI_HEADER_SIZE;
+	
+	while (offset < length) {
+	    struct mcs_dimm_resource_v2 *mcs = PTR_OFS(acpi, offset);
+	    struct td_discovered_info *dev_info;
+
+	    if (mcs->length < MCS_DIMM_RESOURCE_HEADER_SIZE_V2) {
+		    pr_err("MCS DIMM Entry invalid: length == 0 at offset 0x%x\n",
+				    offset);
+		    pr_err(" - acpi = 0x%p (%lu)\n", acpi, sizeof(*acpi));
+		    pr_err(" - mcs = 0x%p (%lu)\n", mcs, sizeof(*mcs));
+		    pr_err("     length(0x%p) %u\n", &mcs->length, mcs->length);
+
+		    for (i = 0; i < acpi->length/16; i++)
+			dump_memory("ACPI: ", PTR_OFS(acpi, i*16), 16);
+
+		    dump_memory("MCS: ", mcs, MCS_DIMM_RESOURCE_HEADER_SIZE_V2);
+		    break;
+	    }
+
+	    if (td_scan_debug && ! cb_func) {
+		    pr_info("MCS-DIMM Entry at offset %u\n", offset);
+		    td_dump_data("  ", mcs, mcs->length);
+	    }
+	    if (cork++ > 256)
+		    break;
+
+	    if(mcs->status != MCS_DIMM_STATUS_OK && process_mcs_issue(mcs->status, mcs->locator_string))
+			    goto skip_dev;
+
+	    dev_info = kmalloc(TD_DISCOVERED_INFO_SIZE(16), GFP_KERNEL);
+	    dev_info->done = td_bios_discovered_done;
+
+	    dev_info->source = "MCS DIMM";
+
+	    dev_info->spd_type = mcs->spd_type;
+	    dev_info->spd_asic = mcs->spd_asic;
+
+	    dev_info->mem_base = mcs->mem_base;
+	    dev_info->mem_size = mcs->mem_size;
+	    dev_info->mem_avoid_mask = mcs->mem_avoid_mask;
+
+	    dev_info->socket = mcs->socket;
+	    dev_info->agent = mcs->agent;
+	    dev_info->channel = mcs->channel;
+	    dev_info->slot = mcs->slot;
+
+	    dev_info->mem_speed = mcs->mem_speed;
+
+	    dev_info->bank_locator = mcs->locator_string;
+
+	    dev_info->spd_count = 16;
+	    for (c = 0; c < 16; c++) {
+		    dev_info->spd[c].idx = 158+c;
+		    dev_info->spd[c].val = mcs->spd_158_173[c];
+	    }
+
+	    if (dev_info->socket == scan_socket) {
+		    scan_socket_count++;
+	    } else {
+		    scan_socket = dev_info->socket;
+		    scan_socket_count = 1;
+	    }
+	    if (scan_socket_count > scan_socket_max)
+		    scan_socket_max = scan_socket_count;
+
+	    if (cb_func && (i % td_scan_x) < td_scan_y)
+		cb_func(dev_info, data);
+	    else {
+		pr_info("Discovered Diablo MCS Device %d in slot %s at 0x%llx\n", i,
+				dev_info->bank_locator, dev_info->mem_base);
+		kfree(dev_info);
+	    }
+
+	    i++;
+
+skip_dev:
+	    offset += mcs->length;
+	}
+
+	return 0;
+}
+
+/*******************************************************************************
+ *
+ * GENERIC ACPI
+ *
+ ******************************************************************************/
+
 struct td_bios_table {
 	char *sig_id;
 	char *oem_id;
 	char *tbl_id;
+	int   revision;
 	int   sig_length;
 	int   oem_length;
 	int   tbl_length;
@@ -394,11 +557,11 @@ struct td_bios_table {
 } td_bios_tables_list[] =
 {
 #ifdef CONFIG_TERADIMM_ACPI_IBM_FLSHDIMM
-	{ "OEM", "IBM", "FLSHDIMM", 3, 3, 8, process_flshdimm, NULL },
+	{ "OEM", "IBM", "FLSHDIMM", 1, 3, 3, 8, process_flshdimm, NULL },
 #endif
-	{ "OEM", NULL,  "MCS-DIMM", 3, 0, 8, process_mcs_dimm, NULL },
+	{ "OEM", NULL,  "MCS-DIMM", 1, 3, 0, 8, process_mcs_dimm_v1, NULL },
+	{ "OEM", NULL,  "MCS-DIMM", 2, 3, 0, 8, process_mcs_dimm_v2, NULL },
 };
-
 
 void td_bios_enumerate(td_scan_callback_t func, void* opaque)
 {
@@ -442,6 +605,9 @@ int td_bios_table_process (struct acpi_table_header *tbl)
 					td_bios_tables_list[j].tbl_length) )
 			continue;
 
+		if (td_bios_tables_list[j].revision != tbl->revision)
+			continue;
+
 		td_bios_tables_list[j].ptr = tbl;
 
 		if (td_scan_debug)
@@ -449,6 +615,11 @@ int td_bios_table_process (struct acpi_table_header *tbl)
 
 		td_bios_tables_list[j].process(td_bios_tables_list[j].ptr,
 				NULL, NULL);
+
+		/* If they want dynamic workers/node */
+		if (td_workers_per_node == 0)
+			td_workers_per_node = scan_socket_max+2;
+
 		return 1;
 	}
 	return 0;
@@ -662,4 +833,3 @@ int td_bios_scan ()
 void td_bios_cleanup()
 {
 }
-

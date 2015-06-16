@@ -75,6 +75,12 @@ struct td_eng_latency {
 	cycles_t    start;          /* cycles at start of current event */
 };
 
+struct td_io_latency_counters {
+	uint64_t latency;          /* !< latest random latency (nsec) */
+	uint64_t lat_acumu;        /* !< accumulated latencies */
+	uint64_t lat_cnt;          /* !< number accumulated latencies */
+};
+
 /**
  * start tracking an event
  *

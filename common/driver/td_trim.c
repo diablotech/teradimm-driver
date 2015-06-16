@@ -50,65 +50,19 @@
  *                                                                       *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#ifndef _TD_SPLIT_REQ_H_
-#define _TD_SPLIT_REQ_H_
-
 #include "td_kdefn.h"
-#include "td_limits.h"
-#include "td_eng_conf.h"
-#include "td_engine.h"
+
+
+#include "td_compat.h"
+
 #include "td_defs.h"
+
 #include "td_bio.h"
-
-
-
-struct td_token;
-struct td_engine;
-
-#define TD_SPLIT_REQ_PART_MAX 128
-
-struct td_biogrp {
-	void                (*_dealloc)(struct td_biogrp*);
-	
-	td_bio_ref	    sr_orig;
-
-	// TODO: atomic
-	atomic_t            sr_total;     /**< total number of splits */
-	atomic_t            sr_finished;  /**< number completed */
-
-	int                 sr_result;
-
-	long                sr_created;
-
-	td_bio_t            sr_bios[0];
-};
-
-
-
-struct td_biogrp* td_biogrp_alloc(unsigned int extra);
-
-/* Deprecated */
-struct td_biogrp* td_biogrp_alloc_kzalloc(struct td_engine* eng,
-		unsigned int extra);
-
-
-
-#ifdef CONFIG_TERADIMM_PRIVATE_SPLIT_STASH
-struct td_biogrp* td_stash_biogrp_alloc(struct td_engine* eng,
-		unsigned int extra);
-#endif
-
-/** returns the biogrp container for a bio, or NULL */
-static inline struct td_biogrp *td_bio_group(td_bio_ref bio)
-{
-	if (! td_bio_is_part(bio))
-		return NULL;
-
-	return (struct td_biogrp *)bio->bi_private;
-}
+#include "td_device.h"
+#include "td_engine.h"
 
 /* returns the number of discard bios that need to be created from this bio */
-static inline int td_bio_discard_count(td_bio_ref bio, struct td_engine *eng)
+int td_bio_trim_count(td_bio_ref bio, struct td_engine *eng)
 {
 	uint64_t start, end; /*start and end lba*/
 	uint64_t start_off, end_off; /*start and end lba offset*/
@@ -200,34 +154,4 @@ not_discard:
 	return (int)count;
 
 }
-/* End part of a split req */
-extern void td_biogrp_complete_part(struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts);
 
-/* releases resources held by a split req */
-static inline void td_biogrp_free(struct td_biogrp *bg)
-{
-	WARN_ON(atomic_read(&bg->sr_finished) < atomic_read(&bg->sr_total));
-	bg->_dealloc(bg);
-}
-
-
-
-/* old interface */
-extern int td_split_req_create_list(struct td_engine *eng, td_bio_ref obio,
-		struct td_biogrp **out_bg, struct bio_list *split_bios);
-
-/* function called for each split request */
-typedef void (*td_split_req_create_cb)(struct td_biogrp *bg,
-		td_bio_ref bio, void *opaque);
-
-/* takes a large bio and splits it into multiple LBA-aligned bios */
-extern int td_split_req_create(struct td_engine *eng, td_bio_ref orig_bio,
-		td_split_req_create_cb cb, void *opaque);
-
-extern int td_split_req_create_discard(struct td_engine *eng,
-		td_bio_ref orig_bio, td_split_req_create_cb cb, void *opaque);
-
-extern int td_bio_split(td_bio_ref obio, unsigned size, td_split_req_create_cb cb, void *opaque);
-extern int td_bio_replicate(td_bio_ref obio, int num, td_split_req_create_cb cb, void *opaque);
-
-#endif

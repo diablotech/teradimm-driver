@@ -591,6 +591,11 @@ int td_cmdgen_reset (uint64_t bytes[8]);
 /* Generate an diablo SSD_CMD */
 int td_cmdgen_ata (uint64_t bytes[8], uint8_t*ata_cmd, int ssd, int data_size);
 
+/* Read 4K */
+int td_cmdgen_bio_read4k(uint64_t bytes[8], uint8_t ssd, uint64_t lba, uint16_t core_buf, uint8_t needs_meta);
+
+/* Write 4K */
+int td_cmdgen_bio_write4k(uint64_t bytes[8], uint8_t ssd, uint64_t lba, uint16_t core_buf, uint8_t needs_meta, uint16_t wep);
 
 /* SET/PUT REGISTER command */
 int td_cmdgen_get_reg (uint64_t bytes[8], uint32_t reg);

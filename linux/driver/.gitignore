@@ -1,4 +1,3 @@
-td_biogrp.c
 td_command.c
 td_compat.c
 td_crypto.c
@@ -16,7 +15,9 @@ td_raid.c
 td_stash.c
 td_token.c
 td_trace.c
+td_trim.c
 td_ucmd.c
 td_util.c
 tr_mirror.c
+tr_mirror_resync.c
 tr_stripe.c

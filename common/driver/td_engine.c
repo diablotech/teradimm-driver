@@ -60,7 +60,6 @@
 #include "td_eng_hal.h"
 #include "td_ioctl.h"
 #include "td_token.h"
-#include "td_biogrp.h"
 #include "td_bio.h"
 #include "td_eng_completion.h"
 #include "td_eng_mcefree.h"
@@ -139,8 +138,10 @@ int __td_eng_run_thread_work (struct td_engine *eng, struct td_eng_thread_work *
 	int rc;
 	void* prev_work;
 
+#if 0
 	/* We need to be locked, to make sure everything stays around */
 	WARN_TD_DEVICE_UNLOCKED(td_engine_device(eng));
+#endif
 
 	rc = -EIO;
 	if (! td_engine_devgroup(eng) ) {
@@ -249,6 +250,13 @@ static int td_test_waiting_incoming_capacity(struct td_engine *eng)
 		     + eng->td_stats.write.req_active_cnt;
 	}
 
+	/* If we are in the raid, we can't sleep either */
+	if (td_device_check_state(td_engine_device(eng), RAID_MEMBER)) {
+		struct td_raid *rdev = td_engine_device(eng)->td_raid;
+		if (rdev && rdev->resync_context.resync_task)
+			return 0;
+	}
+
 	wake_after = max_t(uint64_t,1,wake_after);
 	wake_after = min_t(uint64_t,HZ,wake_after);
 
@@ -315,6 +323,13 @@ int td_test_waiting_incoming_capacity(struct td_engine *eng)
 	if (likely (!sleep_thrsh || active < sleep_thrsh))
 		return 0;
 
+	/* If we are in the raid, we can't sleep either */
+	if (td_device_check_state(td_engine_device(eng), RAID_MEMBER)) {
+		struct td_raid *rdev = td_engine_device(eng)->td_raid;
+		if (rdev && rdev->resync_context.resync_task)
+			return 0;
+	}
+
 	/* we didn't get in, reduce the active count */
 	atomic_dec(&eng->td_total_system_bios);
 
@@ -366,7 +381,7 @@ void td_queue_incoming_bio(struct td_engine *eng, td_bio_ref bio)
 	if (unlikely(rc)) {
 		if (td_ratelimit())
 			td_eng_err(eng, "IO canceled by signal\n");
-		td_bio_endio(eng, bio, rc, 0);
+		td_eng_endio(eng, bio, rc, 0);
 		return;
 	}
 #endif
@@ -404,8 +419,8 @@ void td_migrate_incoming_to_queued(struct td_engine *eng)
 
 	bio_list_merge(&eng->td_queued_bios, &eng->td_incoming_bios);
 
-	eng->td_queued_bio_writes = eng->td_incoming_bio_writes;
-	eng->td_queued_bio_reads  = eng->td_incoming_bio_reads;
+	eng->td_queued_bio_writes += eng->td_incoming_bio_writes;
+	eng->td_queued_bio_reads  += eng->td_incoming_bio_reads;
 
 	/* purge the incoming queue */
 
@@ -474,6 +489,8 @@ void td_enqueue_ucmd(struct td_engine *eng, struct td_ucmd *ucmd)
 
 	spin_lock_bh(&eng->td_queued_ucmd_lock);
 
+	td_ucmd_get(ucmd);
+
 	list_add_tail(&ucmd->queue_link, &eng->td_queued_ucmd_list);
 
 	eng->td_queued_ucmd_count ++;
@@ -517,6 +534,68 @@ static struct td_ucmd *td_pop_ucmd(struct td_engine *eng, int core_avail)
 
 	td_eng_trace(eng, TR_CMD, "ucmd:pop", (uint64_t)ucmd);
 	return ucmd;
+}
+
+/**
+ * return true if this bio will collide with the bio range lock
+ */
+static int td_engine_bio_blocked(struct td_engine *eng, td_bio_ref bio)
+{
+	struct td_engine_range *blocked = &eng->bio_block.range;
+	uint64_t bio_lba_start, bio_lba_end;
+
+	if (likely(!eng->bio_block.flags.active)) {
+#ifdef CONFIG_DEBUG_BIO_LOCKS
+		if (eng->bio_block.debug_bio == bio) {
+			td_eng_trace(eng, TR_BIO, "BIO:unblocked:bio", (uint64_t)bio);
+			td_eng_info(eng, "Unblocked bio %p\n", bio);
+			eng->bio_block.debug_bio = NULL;
+		}
+#endif
+
+		return 0;
+	}
+	
+	bio_lba_start = td_bio_get_sector_offset(bio);
+	bio_lba_end = bio_lba_start;
+	bio_lba_end += (td_bio_get_byte_size(bio) >> SECTOR_SHIFT) - 1;
+	
+	if (bio_lba_end <= blocked->start) {
+#ifdef CONFIG_DEBUG_BIO_LOCKS
+		if (eng->bio_block.debug_bio == bio) {
+			td_eng_trace(eng, TR_BIO, "BIO:unblocked:bio", (uint64_t)bio);
+			td_eng_info(eng, "Unblocked bio %p (%llu,%llu)\n",
+					bio, bio_lba_start, bio_lba_end);
+			eng->bio_block.debug_bio = NULL;
+		}
+#endif
+		return 0;
+	}
+	if (bio_lba_start >= blocked->end) {
+#ifdef CONFIG_DEBUG_BIO_LOCKS
+		if (eng->bio_block.debug_bio == bio) {
+			td_eng_trace(eng, TR_BIO, "BIO:unblocked:bio", (uint64_t)bio);
+			td_eng_info(eng, "Unblocked bio %p (%llu,%llu)\n",
+					bio, bio_lba_start, bio_lba_end);
+			eng->bio_block.debug_bio = NULL;
+		}
+#endif
+		return 0;
+	}
+
+#ifdef CONFIG_DEBUG_BIO_LOCKS
+	if (eng->bio_block.debug_bio != bio) {
+		td_eng_trace(eng, TR_BIO, "BIO:blocked:bio", (uint64_t)bio);
+		td_eng_trace(eng, TR_BIO, " BIO:blocked:start", blocked->start);
+		td_eng_trace(eng, TR_BIO, "  BIO:blocked:end", blocked->end);
+		td_eng_info(eng, "Blocked bio %p (%llu,%llu) overlaps (%llu, %llu)\n",
+				bio, bio_lba_start, bio_lba_end,
+				blocked->start, blocked->end);
+		eng->bio_block.debug_bio = bio;
+	}
+	eng->td_trace.tt_mask = 0;
+#endif
+	return 1;
 }
 
 /**
@@ -649,19 +728,21 @@ done:
  */
 static inline int td_engine_get_bios(struct td_engine *eng,
 		struct bio_list *bios, struct td_io_begin_state *bs)
+	
 {
-	int span, rc, discard;
+	/** os */
+	int rc;
 	td_bio_ref first, bio = NULL;
-//#if defined(_MSC_VER)
-//#else
-	struct td_biogrp *split_req = NULL;
-//#endif
+
 	if (bio_list_empty(&eng->td_queued_bios))
 		td_migrate_incoming_to_queued(eng);
 
 	/* peek at the next upcoming bio */
 	first = bio_list_peek(&eng->td_queued_bios);
 	if (!first)
+		return 0;
+	
+	if (td_engine_bio_blocked(eng, first))
 		return 0;
 
 	if (td_engine_bio_collision(eng, first))
@@ -695,48 +776,13 @@ td_eng_trace(eng, TR_BIO, "BIO:pop:size ", td_bio_get_byte_size(bio));
 	if (unlikely (td_bio_is_empty_barrier(bio)))  {
 		td_eng_err(eng, "Empty barriers are not supported in this release\n");
 		rc = -EIO;
-		td_bio_endio(eng, bio, rc, 0);
-		return rc;
-	}
-#if 0
-	if (unlikely (td_bio_is_part(bio))) {
-		/* already split, return it */
-		bio_list_add(bios, bio);
-		return 1;
-	}
-#endif
-	discard = td_bio_is_discard(bio);
-	span = td_bio_page_span(bio, TERADIMM_DATA_BUF_SIZE);
-	if (likely (span == 1 && discard == 0)) {
-		/* normal bio, single LBA span */
-		bio_list_add(bios, bio);
-		return 1;
-	}
-
-	rc = td_split_req_create_list(eng, bio, &split_req, bios);
-	if (unlikely (rc<0)) {
-		td_eng_err(eng, "failed to split bio, rc=%d dir = %s\n", rc,
-				td_bio_is_write(bio) ? "write" : "read");
-		td_bio_endio(eng, bio, rc, 0);
+		td_eng_endio(eng, bio, rc, 0);
 		return rc;
 	}
 
-	if (unlikely (rc<span && !td_bio_is_discard(bio))) {
-		td_eng_err(eng, "split returned too few parts, "
-				"span=%u, splits=%d\n", span, rc);
-		td_biogrp_free(split_req);
-		rc = -EIO;
-		td_bio_endio(eng, bio, rc, 0);
-		return rc;
-	}
+	bio_list_add(bios, bio);
+	return 1;
 
-	/* increment stats */
-	if (td_bio_is_write(first))
-		eng->td_stats.write.split_req_cnt ++;
-	else
-		eng->td_stats.read.split_req_cnt ++;
-
-	return rc;
 }
 
 /* push a bit to the start of the queue;
@@ -796,7 +842,7 @@ void __td_terminate_all_outstanding_bios(struct td_engine *eng,
 
 	while((bio = bio_list_pop(&terminating))) {
 		int is_write = td_bio_is_write(bio);
-		td_bio_endio(eng, bio, result, 0);
+		td_eng_endio(eng, bio, result, 0);
 		if (is_write)
 			eng->td_stats.write.req_failed_cnt ++;
 		else
@@ -947,6 +993,7 @@ int td_engine_io_sanity_check(struct td_engine *eng)
 			if (work->verbose)
 				td_eng_debug(eng, "Running \"%s\" thread_work\n", work->name);
 			work->result = work->func(eng, work);
+			td_eng_trace(eng, TR_ENGWORK, "thread_work:result", (uint64_t)work->result);
 			complete_all(&work->work_done);
 		}
 	}
@@ -1149,27 +1196,14 @@ reset_and_exit:
 	eng->td_sample_rbytes  = eng->td_stats.read.bytes_transfered;
 	eng->td_sample_wbytes  = eng->td_stats.write.bytes_transfered;
 
-	td_eng_latency_clear(&eng->td_counters.read.req);
-	td_eng_latency_clear(&eng->td_counters.write.req);
-	td_eng_latency_clear(&eng->td_counters.control.req);
-	td_eng_latency_clear(&eng->td_counters.read.hw);
-	td_eng_latency_clear(&eng->td_counters.write.hw);
-	td_eng_latency_clear(&eng->td_counters.control.hw);
+	td_eng_latency_clear((struct td_io_latency_counters *)&eng->counters.read[TD_DEV_GEN_COUNT_REQ_LAT]);
+	td_eng_latency_clear((struct td_io_latency_counters *)&eng->counters.write[TD_DEV_GEN_COUNT_REQ_LAT]);
+	td_eng_latency_clear((struct td_io_latency_counters *)&eng->counters.control[TD_DEV_GEN_COUNT_REQ_LAT]);
+	td_eng_latency_clear((struct td_io_latency_counters *)&eng->counters.read[TD_DEV_GEN_COUNT_HW_LAT]);
+	td_eng_latency_clear((struct td_io_latency_counters *)&eng->counters.write[TD_DEV_GEN_COUNT_HW_LAT]);
+	td_eng_latency_clear((struct td_io_latency_counters *)&eng->counters.control[TD_DEV_GEN_COUNT_HW_LAT]);
 }
 #undef SAMPLED_RATE
-
-/**
- * td_engine_queue_bio helper handling early split of large requests
- */
-#if 0
-static void td_engine_queue_sreq_bio(struct td_biogrp *bg,
-		td_bio_ref bio, void *opaque)
-{
-	struct td_engine *eng = opaque;
-	td_queue_incoming_bio(eng, bio);
-	td_engine_poke(eng);
-}
-#endif
 
 /**
  * \brief receive and queue a bio from the block layer
@@ -1191,7 +1225,7 @@ int td_engine_queue_bio(struct td_engine *eng, td_bio_ref bio)
 	}
 
 	if (unlikely (! td_bio_is_discard(bio) &&
-			td_bio_page_span(bio, TERADIMM_DATA_BUF_SIZE) > TD_SPLIT_REQ_PART_MAX))
+			td_bio_page_span(bio, TERADIMM_DATA_BUF_SIZE) > 1))
 	{
 		goto bad_request;
 	}
@@ -1201,7 +1235,7 @@ int td_engine_queue_bio(struct td_engine *eng, td_bio_ref bio)
 		if (td_ratelimit())
 			td_eng_warn(eng, "request in state %d (pm)\n",
 					td_run_state(eng));
-		td_bio_endio(eng, bio, -EAGAIN, 0);
+		td_eng_endio(eng, bio, -EAGAIN, 0);
 		goto done;
 	}
 
@@ -1225,24 +1259,13 @@ int td_engine_queue_bio(struct td_engine *eng, td_bio_ref bio)
 		if (td_ratelimit())
 			td_eng_warn(eng, "request in state %d\n",
 					td_run_state(eng));
-		td_bio_endio(eng, bio, -EIO, 0);
+		td_eng_endio(eng, bio, -EIO, 0);
 		goto done;
 	}
 
-	/* TODO: should support plugged operation and call blk_queue_plug() */
-#if 0
-/* this is disabled because td_biogrp_alloc() doesn't lock, and devgroup
- * now uses multiple threads so it's harder to determine when to do it */
-	if (unlikely (td_eng_conf_var_get(eng, EARLY_SPLIT_REQ))) {
-		int span = td_bio_page_span(bio);
-		if (likely (span > 1)) {
-			int rc = td_split_req_create(eng, bio,
-					td_engine_queue_sreq_bio, eng);
-			if (unlikely (rc<0))
-				goto bad_request;
-			goto done;
-		}
-	}
+
+#ifdef CONFIG_TERADIMM_BIO_FTRACE
+	trace_printk("TD %s incoming\n", td_eng_name(eng));
 #endif
 
 	td_queue_incoming_bio(eng, bio);
@@ -1256,7 +1279,11 @@ bad_request:
 			td_bio_get_byte_size(bio),
 			td_bio_get_sector_offset(bio),
 			td_bio_is_write(bio) ? "write" : "read");
-	td_bio_endio(eng, bio, -EIO, 0);
+	/**
+	 * We are not in the engine yet, we can return a failure to
+	 * the caller here
+	 */
+	return -EIO;
 done:
 	return 0;
 }
@@ -1451,7 +1478,7 @@ static void td_release_tok_bio(struct td_token *tok, int result)
 
 
 	/* complete */
-	td_bio_endio(eng, bio, result, tok->ts_end - tok->ts_start);
+	td_eng_endio(eng, bio, result, tok->ts_end - tok->ts_start);
 	tok->host.bio = NULL;
 
 	/* update counters */
@@ -1550,11 +1577,11 @@ static void td_complete_deallocation(struct td_token *tok, int result)
 
 	case -EFAULT:
 		/* if the command is OoO, we should resend the deallocate */
-		eng->td_counters.misc.deallocation_error_cnt ++;
+		td_eng_counter_misc_inc(eng, DEALLOCATION_ERROR_CNT);
 		break;
 
 	case -ETIMEDOUT:
-		eng->td_counters.misc.deallocation_timeout_cnt ++;
+		td_eng_counter_misc_inc(eng, DEALLOCATION_TIMEOUT_CNT);
 #ifdef CONFIG_TERADIMM_RDBUF_TRACKING
 		/* if read-buffers are being tracked, and the user requested
 		 * to not replay timedout deallocations, do so. */
@@ -1566,7 +1593,7 @@ static void td_complete_deallocation(struct td_token *tok, int result)
 		break;
 
 	default:
-		eng->td_counters.misc.deallocation_error_cnt ++;
+		td_eng_counter_misc_inc(eng, DEALLOCATION_ERROR_CNT);
 		return;
 	}
 
@@ -1589,15 +1616,15 @@ static void td_request_end_common(struct td_token *tok)
 	if (td_token_is_read(tok))
 		td_eng_latency_end(&eng->td_tok_latency, tok,
 				"hw-rd-latency",
-				&eng->td_counters.read.hw);
+				(struct td_io_latency_counters *)&eng->counters.read[TD_DEV_GEN_COUNT_HW_LAT]);
 	else if (td_token_is_write(tok))
 		td_eng_latency_end(&eng->td_tok_latency, tok,
 				"hw-wr-latency",
-				&eng->td_counters.write.hw);
+				(struct td_io_latency_counters *)&eng->counters.write[TD_DEV_GEN_COUNT_HW_LAT]);
 	else
 		td_eng_latency_end(&eng->td_tok_latency, tok,
 				"hw-ctrl-latency",
-				&eng->td_counters.control.hw);
+				(struct td_io_latency_counters *)&eng->counters.control[TD_DEV_GEN_COUNT_HW_LAT]);
 
 
 	/* allow a kernel caller to act on this completion */
@@ -2135,7 +2162,7 @@ static struct td_token *td_engine_construct_rmw_token_for_bio(struct td_engine *
 	tok->ops.pre_completion_hook = td_engine_rmw_read_completion;
 
 	/* increment stats */
-	eng->td_counters.misc.read_modify_write_cnt ++;
+	td_eng_counter_misc_inc(eng, READ_MODIFY_WRITE_CNT);
 
 	return tok;
 
@@ -2388,7 +2415,7 @@ static struct td_token *td_engine_construct_token_for_bio(struct td_engine *eng,
 		 * If we can do SEC, we'll do it...
 		 * These values should be tunable
 		 */
-		switch (td_bio_flags_ref(bio)->commit_level) {
+		switch (td_bio_flags_get_commitlevel(bio)) {
 		case TD_SUPER_EARLY_COMMIT:
 			/* this isl SEC mode that uses 2 WEPs */
 			weps_needed = 2;
@@ -2461,7 +2488,8 @@ static int td_engine_io_begin_one_bio(struct td_engine *eng,
 	/*
 	 * Stamp our commit state info on this BIO right now
 	 */
-	td_bio_flags_ref(bs->bio)->commit_level = (uint8_t)td_eng_conf_var_get(eng, EARLY_COMMIT);
+	td_bio_flags_set_commitlevel(bs->bio, (uint8_t)td_eng_conf_var_get(eng, EARLY_COMMIT));
+	//td_bio_flags_ref(bs->bio)->commit_level = (uint8_t)td_eng_conf_var_get(eng, EARLY_COMMIT);
 
 	if (unlikely (td_bio_needs_rmw(eng, bs->bio)))
 		tok = td_engine_construct_rmw_token_for_bio(eng, bs);
@@ -2492,9 +2520,7 @@ static int td_engine_io_begin_one_bio(struct td_engine *eng,
 	return 0;
 
 failed_to_get_token:
-	if (bs->bio)
-		td_engine_push_bio(eng, bs->bio);
-	bs->bio = NULL;
+	/* It is the responsibility of the caller to handle bs.bio */
 	return -EIO;
 }
 
@@ -2530,7 +2556,7 @@ static int td_engine_io_begin_block(struct td_engine *eng, uint *max)
 				/* this was a zero sized IO */
 				td_eng_trace(eng, TR_TOKEN, "zero-sized-bio-skipped",
 						0);
-				td_bio_endio(eng, bs.bio, 0, 0);
+				td_eng_endio(eng, bs.bio, 0, 0);
 				bs.bio = NULL;
 				continue;
 			}
@@ -2538,10 +2564,15 @@ static int td_engine_io_begin_block(struct td_engine *eng, uint *max)
 #ifdef CONFIG_TERADIMM_ABSOLUTELY_NO_READS
 			if (td_bio_is_write(bs.bio)) {
 				td_eng_trace(eng, TR_TOKEN, "HACK:skip-read:bio", (long)bs.bio);
-				td_bio_endio(eng, bs.bio, 0);
+				td_eng_endio(eng, bs.bio, 0);
 				bs.bio = NULL;
 				continue;
 			}
+#endif
+
+#ifdef CONFIG_TERADIMM_BIO_FTRACE
+			trace_printk("TD %s start bio[%llu]\n", td_eng_name(eng),
+					td_bio_get_sector_offset(bs.bio));
 #endif
 
 			rc = td_engine_io_begin_one_bio(eng, &bs);
@@ -2693,7 +2724,7 @@ static void td_engine_handle_repeat_exhausted(struct td_engine *eng,
 		goto error_out;
 
 	/* count a token that's resent */
-	eng->td_counters.token.forced_seq_advance ++;
+	td_eng_counter_token_inc(eng, FORCED_SEQ_ADVANCE);
 
 	/* it restarted, so add it to the active list */
 	tok->result = TD_TOK_RESULT_ACTIVE;
@@ -2755,7 +2786,7 @@ static void td_engine_io_repeat_list(struct td_engine *eng,
 						td_token_error_dump(tok, "SUPPRESS");
 				tok->result = TD_TOK_RESULT_FAIL_ABORT;
 				list_add_tail(&tok->link, complete_list);
-				eng->td_counters.token.sec_ignore_retry ++;
+				td_eng_counter_token_inc(eng, SEC_IGNORE_RETRY);
 				continue;
 			}
 		}
@@ -2797,7 +2828,7 @@ static void td_engine_io_repeat_list(struct td_engine *eng,
 
 			/* account for replays while the buddy had replays */
 			if (tok->sec_buddy && tok->sec_buddy->cmd_issue_count > 1)
-				eng->td_counters.token.double_sec_replay ++;
+				td_eng_counter_token_inc(eng, DOUBLE_SEC_REPLAY);
 		}
 
 		/* command had checksum failure, have the hardware
@@ -2817,7 +2848,7 @@ static void td_engine_io_repeat_list(struct td_engine *eng,
 
 token_is_active_again:
 		/* count a token that's resent */
-		eng->td_counters.token.retries_cnt ++;
+		td_eng_counter_token_inc(eng, RETRIES_CNT);
 
 		/* it restarted, so add it to the active list */
 		tok->result = TD_TOK_RESULT_ACTIVE;
@@ -3446,6 +3477,147 @@ int td_engine_unlock(struct td_engine *eng, void *locker_context)
 	return rc;
 };
 
+struct td_eng_bio_range_work_state {
+	struct td_eng_thread_work work;
+	struct td_engine_range *range;
+	int check_queue;
+};
+
+static int __td_bio_overlaps (struct td_engine *eng, struct td_engine_range *r, td_bio_ref b, const char* type)
+{
+	uint64_t lba_start, lba_end;
+	lba_end = lba_start = td_bio_get_sector_offset(b);
+	lba_end += (td_bio_get_byte_size(b) >> SECTOR_SHIFT) - 1;
+
+	if (lba_end < r->start)
+		return 0;
+	if (lba_start > r->end)
+		return 0;
+
+#ifdef CONFIG_DEBUG_BIO_LOCKS
+	td_eng_info(eng, "%s[%u] RANGE %llu,%llu overlaps with %s bio %p (%llu, %u)\n",
+			current->comm, current->pid,
+			r->start, r->end,
+			type, b,
+			td_bio_get_sector_offset(b),
+			td_bio_get_byte_size(b));
+#endif
+	return 1;
+
+}
+int __td_engine_block_bio_range (struct td_engine *eng, void* data)
+{
+	struct td_eng_bio_range_work_state *state = data;
+	
+	td_eng_trace(eng, TR_BIO, "block_bio:old:start", eng->bio_block.range.start);
+	td_eng_trace(eng, TR_BIO, "block_bio:old:end", eng->bio_block.range.end);
+	if (state->range) {
+		struct td_token *tok, *nxt;
+		td_bio_ref bio;
+		
+		td_eng_trace(eng, TR_BIO, "block_bio:attempt:start", state->range->start);
+		td_eng_trace(eng, TR_BIO, "block_bio:attempt:end", state->range->start);
+
+		if (0) td_eng_info(eng, "TODO: Check active tokens for %llu-%llu\n",
+				state->range->start, state->range->end);
+		
+		for_each_token_list_token(tok, nxt,
+				&eng->tok_pool[TD_TOK_FOR_FW].td_active_tokens) {
+			if (! (bio = tok->host.bio))
+				continue;
+			if (__td_bio_overlaps(eng, state->range, bio, "ACTIVE") ) {
+				return -EBUSY;
+			}
+		}
+
+		if (state->check_queue) {
+			/* Migrate anything previously queued */
+			td_migrate_incoming_to_queued(eng);
+
+			/* Walk the bio list, checking each of them */
+			bio_list_for_each(bio, &eng->td_queued_bios) {
+				if (__td_bio_overlaps(eng, state->range, bio, "QUEUED"))
+					return -EBUSY;
+			}
+		}
+
+		eng->bio_block.flags.active = 1;
+		memcpy(&eng->bio_block.range, state->range, sizeof(struct td_engine_range));
+	} else {
+		eng->bio_block.flags.active = 0;
+		memset(&eng->bio_block.range, 0, sizeof(struct td_engine_range));
+	}
+
+#ifdef CONFIG_DEBUG_BIO_LOCKS
+	eng->bio_block.debug_bio = NULL;
+#endif
+
+	td_eng_trace(eng, TR_BIO, "block_bio:done:active", eng->bio_block.flags.active);
+
+	return 0;
+}
+
+int td_engine_block_bio_range (struct td_engine *eng, uint64_t start, uint64_t end, int queued)
+{
+	long cork = 0;
+	int rc;
+	
+	struct td_engine_range block_range = {
+		.start = start,
+		.end = end,
+	};
+	
+	struct td_eng_bio_range_work_state thread_work = {
+		.work.name = "lock_bio_range",
+		.work.func = __td_engine_block_bio_range,
+		.work.verbose = 0,
+		.range = &block_range,
+		.check_queue = queued,
+	};
+
+	if (0) td_eng_info(eng, "BIO_RANGE: lock %llu-%llu\n",
+			start, end);
+
+	do {
+		rc = td_eng_thread_work(eng, &thread_work.work);
+		if (!rc)
+			rc= thread_work.work.result;
+		if (cork++ > 1000000)
+			break;
+		
+		/*
+		 * If the lock couldn't be taken (BUSY), then
+		 * we need to allow time for the IOs that were going to
+		 * complete
+		 */
+		if (rc == -EBUSY)
+			msleep(100);
+		else if (rc)
+			td_eng_info(eng, "BIO_RANGE_LOCK: rc = %d", rc);
+	} while (rc == -EBUSY);
+		
+	return rc;
+}
+
+int td_engine_unblock_bio_range (struct td_engine *eng)
+{
+	int rc;
+	struct td_eng_bio_range_work_state thread_work = {
+		.work.name = "lock_bio_range",
+		.work.func = __td_engine_block_bio_range,
+		.work.verbose = 0,
+		.range = NULL,
+	};
+
+	if (0) td_eng_info(eng, "BIO_RANGE: Unlock\n");
+	rc = td_eng_thread_work(eng, &thread_work.work);
+	
+	if (rc)
+		td_eng_err(eng, "Couldn't unlock range\n");
+	return 0;
+}
+
+
 int td_engine_recover_read_buffer_orphans(struct td_engine *eng)
 {
 	int recovered = 0;
@@ -3623,6 +3795,18 @@ int td_engine_init(struct td_engine *eng, struct td_device *dev)
 		goto error_find_ops;
 	}
 
+	eng->td_read_data_cache = vmalloc_node(
+			TD_HOST_RD_BUFS_PER_DEV * TERADIMM_DATA_BUF_SIZE,
+			dev->td_cpu_socket);
+	eng->td_read_meta_cache = vmalloc_node(
+			TD_HOST_RD_BUFS_PER_DEV * TERADIMM_META_BUF_SIZE,
+			dev->td_cpu_socket);
+	if (! (eng->td_read_data_cache && eng->td_read_meta_cache)) {
+		td_eng_err(eng, "Could not allocate %u pages for read cache\n",
+				TD_HOST_RD_BUFS_PER_DEV);
+		goto error_read_buffer_cache;
+	}
+
 	td_eng_conf_init(eng, &eng->conf);
 	td_monitor_bins_init(&eng->ecc_bins.ddr3);
 	td_monitor_bins_init(&eng->ecc_bins.internal);
@@ -3658,7 +3842,7 @@ int td_engine_init(struct td_engine *eng, struct td_device *dev)
 	eng->td_bio_copy_ops = td_token_copy_ops_null;
 	eng->td_virt_copy_ops = td_token_copy_ops_null;
 
-	memset(&eng->td_counters, 0, sizeof(eng->td_counters));
+	memset(&eng->counters, 0, sizeof(eng->counters));
 
 	/* initialize tokens */
 	if (td_all_active_tokens(eng))
@@ -3820,6 +4004,11 @@ int td_engine_init(struct td_engine *eng, struct td_device *dev)
 
 error_ops_init:
 error_ops_trace:
+error_read_buffer_cache:
+	if (eng->td_read_data_cache)
+		vfree(eng->td_read_data_cache);
+	if (eng->td_read_data_cache)
+		vfree(eng->td_read_data_cache);
 error_find_ops:
 	return rc;
 }
@@ -3969,6 +4158,14 @@ engine_state_fail:
 	return ret;
 }
 
+static int __td_engine_suspend (struct td_engine *eng, void* data)
+{
+	/* Do the state switch */
+	td_run_state_enter(eng, PM_DRAIN);
+
+	return 0;
+}
+
 /* enter lower power state.  */
 int td_engine_suspend(struct td_engine *eng, pm_message_t state)
 {
@@ -3976,6 +4173,7 @@ int td_engine_suspend(struct td_engine *eng, pm_message_t state)
 	int ret = -EIO;
 	struct td_devgroup *dg;
 	struct td_device *dev;
+	struct td_eng_thread_work work;
 	int to;
 
 	dev = td_engine_device(eng);
@@ -3989,37 +4187,27 @@ int td_engine_suspend(struct td_engine *eng, pm_message_t state)
 		goto easy_out;
 	}
 
-	/* detach from current group */
-	if (td_devgroup_remove_device(dg, dev))
-		goto error_remove_grp;
-
-	/* sync */
-	(void) td_devgroup_sync_device(dg, dev);
-
 	if (!td_state_can_enter_pm(eng))
 		goto error_enter_pm;
+
+	work.name = "engine_suspend";
+	work.func = __td_engine_suspend;
+
+	ret = td_eng_thread_work(eng, &work);
+	if (ret)
+		goto error_thread_work;
+	else if (work.result) {
+		ret = work.result;
+		goto error_thread_work;
+	}
 
 	if (PM_EVENT_HIBERNATE == state.event)
 		eng->pm_power_cycle = 1;
 
-	/* Do the state switch */
-	td_run_state_enter(eng, PM_DRAIN);
-
 	/* Reset notifier to be safe */
 	INIT_COMPLETION(eng->td_state_change_completion);
 
-	/* Re-add to the group. */
-	if (td_devgroup_add_device(dg, dev))
-		goto error_add_grp;
-
-
 	td_device_unlock(dev);
-
-	/* wake up the thread */
-	td_devgroup_poke(dg);
-
-	/* sync */
-	(void) td_devgroup_sync_device(dg, dev);
 
 	/* Wait for final state: PM_SLEEP */
 	to = td_run_state_wait_ms(eng, PM_SLEEP, 10200);
@@ -4046,24 +4234,16 @@ easy_out:
 	eng->td_prev_state = current_state;
 	return ret;
 
-/* Errors */
-error_add_grp:
-	/* Restore the state to the previous state */
-	__td_run_state_enter(eng, __FUNCTION__, __FILENAME__, __LINE__, eng->td_prev_state);
-
-error_enter_pm:
-	/* Re-add to group.*/
-	td_devgroup_add_device(dg, dev);
-
-error_remove_grp:
-	td_device_unlock(dev);
-	return ret;
-
 /* Aborts */
 error_not_sleeping:
+	td_device_lock(dev);
+error_enter_pm:
+error_thread_work:
+	/* not able to put device to sleep, going DEAD */
+	td_eng_err(eng, "Unable to put device to sleep, going DEAD.  I/O may be lost.\n");
+	td_run_state_enter(eng, DEAD);
 	eng->td_prev_state = current_state;
-	/* Reset the device including SATA links, if necessary. */
-	td_engine_resume(eng);
+	td_device_unlock(dev);
 	return ret;
 }
 #endif
@@ -4176,6 +4356,11 @@ int td_engine_exit(struct td_engine *eng)
 	/* 512 is enough for 2 bios, which is common for un-aligned IO */
 	td_stash_destroy(eng, eng->td_split_stash);
 #endif
+
+	if (eng->td_read_data_cache)
+		vfree(eng->td_read_data_cache);
+	if (eng->td_read_meta_cache)
+		vfree(eng->td_read_meta_cache);
 
 	return 0;
 }

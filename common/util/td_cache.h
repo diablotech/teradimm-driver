@@ -67,7 +67,7 @@
 #include "td_compat.h"
 
 /* NTF flush mode writes this word over each cacheline to invalidate */
-#define TERADIMM_NTF_FILL_WORD 0xffffffffffffffffULL
+#define TERADIMM_NTF_FILL_WORD 0x0ULL
 
 /**
  * cause the cachelines of a buffer to be flushed
@@ -99,6 +99,25 @@ do {                                                                          \
 		break;                                                        \
 	}                                                                     \
 } while(0)
+
+#define td_rdbuf_flush(eng, pre_or_post,ptr, len, old_cache)                  \
+do {                                                                          \
+	switch (td_eng_conf_var_get(eng, CLFLUSH) & TD_FLUSH_RDBUF_MASK) {        \
+	case TD_FLUSH_RDBUF_CLF_##pre_or_post:                                \
+		clflush_cache_range(ptr, len);                                \
+		break;                                                        \
+	case TD_FLUSH_RDBUF_NTF_##pre_or_post:                                \
+		if (old_cache) {                                              \
+			if (0) printk("RDBUF FLUSH: td_memcpy_8x8_movnti(%p, %p, %u)\n", ptr, old_cache, len); \
+			td_memcpy_8x8_movnti(ptr, old_cache, len);            \
+		} else {                                                      \
+			if (0) printk("RDBUF FLUSH: td_fill_8x8_movnti(%p, %016llu, %u)\n", ptr, TERADIMM_NTF_FILL_WORD, len); \
+			td_fill_8x8_movnti(ptr, TERADIMM_NTF_FILL_WORD, len); \
+		}                                                             \
+		break;                                                        \
+	}                                                                     \
+} while(0)
+
 
 /** true if {PRE,POST} is enabled for buffer type */
 #define td_cache_flush_test(eng,pre_or_post,buffer_type)                      \

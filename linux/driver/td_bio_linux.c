@@ -50,11 +50,17 @@
  *                                                                       *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#include "td_biogrp.h"
+#include "td_kdefn.h"
+
+
+#include "td_compat.h"
+
+#include "td_defs.h"
+#include "td_bio.h"
 #include "td_util.h"
 #include "td_device.h"
 #include "td_engine.h"
-#include "td_bio.h"
+#include "td_osdev.h"
 
 #define TD_SPLIT_TRIM_SIZE      512
 
@@ -64,7 +70,103 @@
 #define __advance_ovec() ({ ovec_used=0; \
 		++oidx; WARN_ON(oidx>obio->bi_vcnt); ++ovec; })
 
+#define DEBUG_SPLIT_PRINTK 0
 
+/*
+ * Update any OS/Block layer stats we know about
+ */
+static void td_bio_stats(td_bio_ref bio, int result, cycles_t ts)
+{
+	struct td_osdev *odev = bdev_compat_pdata_dev(bio->bi_bdev);
+	int rw = bio_data_dir(bio);
+	unsigned int size = td_bio_get_byte_size(bio);
+	struct gendisk *disk = odev->disk;
+
+	if (disk) {
+#if defined(part_stat_lock)
+		int cpu = part_stat_lock();
+		struct hd_struct *part = disk_map_sector_rcu(disk, bio->bio_sector);
+		if (rw) {
+			part_stat_add(cpu, part, sectors[rw], size/512);
+		}
+		else {
+			part_stat_add(cpu, part, sectors[rw], size/512);
+		}
+		part_stat_add(cpu, part, ticks[rw], td_cycles_to_msec(ts));
+		part_stat_inc(cpu, part, ios[rw]);
+#else
+		if (rw) {
+			disk_stat_add(disk, sectors[rw], size/512);
+		}
+		else {
+			disk_stat_add(disk, sectors[rw], size/512);
+		}
+		disk_stat_inc(disk, ios[rw]);
+		disk_stat_add(disk, ticks[rw], td_cycles_to_msec(ts));
+#endif
+	}
+}
+
+/*
+ * Main engine "endio" function
+ *
+ * The protocol engine doesn't know about bio parts.  It just ends any BIO it
+ * has with this function.  This function must know if it's a part, etc, and
+ * know if it's a part, if it has to call a part done callback (think raid)
+ */
+void td_bio_endio(struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts)
+{
+#ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
+	struct td_devgroup *dg;
+#endif
+	if (unlikely (td_bio_is_part(bio))) {
+	        td_biogrp_complete_part(eng, bio, result, ts);
+	        return;
+	}
+
+	/* Clear any flags, that we know may be here, and could throw off
+	 * any OS stuff */
+	bio->bio_size -= bio->bio_size & 0x00FF;
+	
+	/*
+	 * We have to do the stats now, or we loose our start timestamp in
+	 * the queued endio case
+	 */
+	td_bio_stats(bio, result, ts);
+
+#ifdef CONFIG_TERADIMM_BIO_FTRACE
+	trace_printk("TD %s end bio[%llu] rc=%d\n", td_eng_name(eng),
+			td_bio_get_sector_offset(bio), result);
+#endif
+
+	/*
+	 * The error path is always handled inline - we need to give
+	 * the error to the front end so they can handle it
+	 * immediately
+	 */
+	if (unlikely(result))
+		td_bio_complete_failure(bio, eng);
+#ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
+	else  if ( (dg = td_engine_devgroup(eng)) &&
+			td_dg_conf_general_var_get(dg, ENDIO_ENABLE) )
+		td_devgroup_queue_endio_success(dg, bio);
+#endif
+	else
+		td_bio_complete_success(bio);
+}
+
+/*
+ * Failure must be communicated to the OSDEV _bio_error function
+ */
+void td_bio_complete_failure (td_bio_ref bio, struct td_engine *eng)
+{
+	struct td_osdev *odev = bdev_compat_pdata_dev(bio->bi_bdev);
+
+	if (odev->_bio_error)
+		odev->_bio_error(odev, bio);
+
+	__bio_endio(bio, -EIO);
+}
 
 int td_split_req_create_discard(struct td_engine *eng, struct bio *obio,
 		td_split_req_create_cb cb, void *opaque)
@@ -93,7 +195,7 @@ int td_split_req_create_discard(struct td_engine *eng, struct bio *obio,
 	td_eng_trace(eng, TR_TRIM, "BIO:trim:sctr", obio->bio_sector);
 	td_eng_trace(eng, TR_TRIM, "BIO:trim:size", obio->bio_size);
 
-	max_nbios = td_bio_discard_count(obio, eng);
+	max_nbios = td_bio_trim_count(obio, eng);
 
 	if (!max_nbios || max_nbios > TD_SPLIT_REQ_PART_MAX)
 		return -EINVAL;
@@ -109,20 +211,20 @@ int td_split_req_create_discard(struct td_engine *eng, struct bio *obio,
 	if (!sreq)
 		return -ENOMEM;
 
+	/* Initialize the fixed members of the  biogroup structure */
+	sreq->sr_created = td_get_cycles();
+	sreq->sr_parts = max_nbios;
+	sreq->sr_orig = obio;
+	sreq->sr_result = 0;
+
 	/* remaining data is chopped up for bio's and vec's */
 	next_nbio = (void*)(sreq + 1);
 	next_nvec = (void*)(next_nbio + max_nbios);
 	buf = (void*)(next_nvec + max_nvecs);
 
-	sreq->sr_orig = obio;
-
-	atomic_set(&sreq->sr_total, 0);
 
 	/* ret_count is a private counter, returned to the caller */
 	ret_count = 0;
-
-	sreq->sr_created = td_get_cycles();
-	sreq->sr_result = 0;
 
 	/* start on the first vec of the old bio */
 	oidx = obio->bio_idx;
@@ -247,7 +349,6 @@ int td_split_req_create_discard(struct td_engine *eng, struct bio *obio,
 
 		nbio->bio_idx = 0;
 		nbio->bi_private = sreq;
-		atomic_inc(&sreq->sr_total);
 
 
 		/* setup the vector. Data will be filled out after the sector
@@ -283,9 +384,8 @@ int td_split_req_create_discard(struct td_engine *eng, struct bio *obio,
 
 }
 
-
-int td_bio_split (td_bio_ref obio, unsigned split_size,
-		td_split_req_create_cb cb, void *opaque)
+int td_biogrp_create (td_bio_ref obio, struct td_biogrp_options *ops,
+		void* opaque)
 {
 	uint oidx;
 	struct bio_vec *ovec;
@@ -294,16 +394,19 @@ int td_bio_split (td_bio_ref obio, unsigned split_size,
 	uint ovec_used, obio_ofs, obio_left;
 	struct bio *next_nbio;
 	struct bio_vec *next_nvec;
-	struct td_biogrp *sreq;
+	struct td_biogrp *bgrp;
 	int ret_count;
 
-#if 0
-	if (td_bio_is_part(obio))
-		return -EINVAL;
-#endif
+	max_nbios = td_bio_page_span(obio, TERADIMM_DATA_BUF_SIZE) * ops->duplicate_count;
 
-	max_nbios = td_bio_page_span(obio, TERADIMM_DATA_BUF_SIZE);
-
+	/** 
+	 * \brief 
+	 * 
+	 * @param TD_SPLIT_REQ_PART_MAX 
+	 * @return 
+	 * 
+	 *	TODO: add comments here
+	 */
 	if (max_nbios < 1 || max_nbios > TD_SPLIT_REQ_PART_MAX)
 		return -EINVAL;
 
@@ -312,29 +415,27 @@ int td_bio_split (td_bio_ref obio, unsigned split_size,
 	size = (max_nbios * sizeof(struct bio))
 		+ (max_nvecs * sizeof(struct bio_vec));
 
-	sreq = td_biogrp_alloc(size);
-	if (!sreq)
+	bgrp = td_biogrp_alloc(size);
+	if (!bgrp)
 		return -ENOMEM;
 
+	/* Initialize the fixed members of the  biogroup structure */
+	bgrp->sr_created = td_get_cycles();
+	bgrp->sr_parts = max_nbios;
+	bgrp->sr_orig = obio;
+	bgrp->sr_result = 0;
+	bgrp->_error_part = ops->error_part;
+
 	/* remaining data is chopped up for bio's and vec's */
-	next_nbio = (void*)(sreq + 1);
+	next_nbio = (void*)(bgrp + 1);
 	next_nvec = (void*)(next_nbio + max_nbios);
 
-	if (0) printk("SPLIT (%p) NBIOS %d\n", obio, max_nbios);
+	if (DEBUG_SPLIT_PRINTK) printk("SPLIT (%p) NBIOS %d\n", obio, max_nbios);
 
-	sreq->sr_orig = obio;
-
-	/* sr_total is always one ahead of what is begin constructed; on final
-	 * pass through the chopping while() loop below, the sr_total is not
-	 * incremented; this way the callback function could consume the
-	 * fragments asynchronously and the release will not happen too early */
-	atomic_set(&sreq->sr_total, 1);
 
 	/* ret_count is a private counter, returned to the caller */
 	ret_count = 0;
 
-	sreq->sr_created = td_get_cycles();
-	sreq->sr_result = 0;
 
 	/* start on the first vec of the old bio */
 	oidx = obio->bio_idx;
@@ -349,19 +450,20 @@ int td_bio_split (td_bio_ref obio, unsigned split_size,
 	obio_left = td_bio_get_byte_size(obio);
 
 	while (obio_left) {
+		int reps;
 		uint lba_ofs, lba_left;
 		struct bio *nbio;
 		struct bio_vec *nvec;
 		uint nbio_left;
 		td_bio_flags_t flags = { .u8 = 0 };
 
-		
+
 		/* first create a new bio which describes the access the LBA
 		 * starting at addr; the access end either at the LBA boundary
 		 * or when the overall access is finished */
 
-		lba_ofs  = addr % split_size;
-		lba_left = split_size - lba_ofs;
+		lba_ofs  = addr % ops->split_size;
+		lba_left = ops->split_size - lba_ofs;
 
 		nbio = __next_nbio();
 
@@ -375,12 +477,14 @@ int td_bio_split (td_bio_ref obio, unsigned split_size,
 
 		if (0) printk(" PART (%p) %d/%d (%p) sector %lu size %u\n",
 			nbio, ret_count+1, max_nbios, obio->bi_private,
-			nbio->bi_sector, nbio->bi_size);
+			nbio->bio_sector, nbio->bio_size);
 
 		nbio_left = nbio->bio_size;
 
 		/* next try to assign the new bio transfer to pages in the old
 		 * vecs */
+
+		BUG_ON(nbio_left == 0);
 
 		while(nbio_left) {
 
@@ -415,161 +519,29 @@ int td_bio_split (td_bio_ref obio, unsigned split_size,
 		nbio->bio_size |= flags.u8;
 
 		/* associate the new bio with the container */
-		nbio->bi_private = sreq;
+		nbio->bi_private = bgrp;
 
-		/* collect the total number */
-		if (obio_left)
-			atomic_inc(&sreq->sr_total);
-		ret_count ++;
+		for (reps = 1; reps < ops->duplicate_count; reps++) {
+			struct bio_vec *r_nvec = __next_nvec();
+			struct bio * r_nbio = __next_nbio();
+			memcpy(r_nvec, nvec, sizeof(struct bio_vec));
+			memcpy(r_nbio, nbio, sizeof(struct bio));
 
-		/* add the new bio to the list */
-		if (0) printk(" CB[%p](%p, %p, %p)\n", cb, sreq, nbio, opaque);
-		cb(sreq, nbio, opaque);
+			if (DEBUG_SPLIT_PRINTK) printk(" CB[%d](%p, %p, %p)\n", ret_count, bgrp, nbio, opaque);
+			ops->submit_part(bgrp, r_nbio, opaque);
+			ret_count ++;
+		}
 
-		/* if obio_left == 0, sreq and nbio cannot be used safely, as
+		/* if obio_left == 0, bgrp and nbio cannot be used safely, as
 		 * the callback could have freed the entire strucutre */
-	}
-
-	WARN_ON(ret_count > max_nbios);
-
-	return ret_count;
-}
-
-int td_bio_replicate (td_bio_ref obio, int num_bios,
-		td_split_req_create_cb cb, void *opaque)
-{
-	td_bio_flags_t flags = { .u8 = 0 };
-	struct td_biogrp *sreq;
-	struct bio *next_nbio;
-	struct bio_vec *next_nvec, *ovec;
-	int max_nvecs, size;
-	int ret_count;
-	
-	flags.is_part = 1;
-
-	max_nvecs = num_bios * 2;
-
-	size = num_bios * sizeof(struct bio)
-		+ (max_nvecs * sizeof(struct bio_vec));
-
-	sreq = td_biogrp_alloc(size);
-
-	sreq->sr_orig = obio;
-	atomic_set(&sreq->sr_total, num_bios);
-
-	/* ret_count is a private counter, returned to the caller */
-	ret_count = 0;
-	
-	sreq->sr_created = jiffies;
-	sreq->sr_result = 0;
-
-	/* remaining data is chopped up for bio's and vec's */
-	next_nbio = (void*)(sreq + 1);
-	next_nvec = (void*)(next_nbio + num_bios);
-
-
-	if (0) printk("REPLICATE (%p) NBIOS %d\n", obio, num_bios);
-
-	ret_count = 0;
-	while (ret_count < num_bios) {
-		uint left;
-		struct bio *nbio =  __next_nbio();
-		memcpy(nbio, obio, sizeof(struct bio));
-		
-		left = nbio->bi_vcnt;
-		ovec = bio_iovec_idx(obio, obio->bio_idx);
-		
-		while (left--) {
-			struct bio_vec *nvec = __next_nvec();
-			memcpy(nvec, ovec, sizeof(struct bio_vec));
-			
-			ovec++;
-		}
-
-		if (0) printk(" PART (%p) %d/%d (%p) sector %lu size %u\n",
-			nbio, ret_count+1, num_bios, obio->bi_private,
-			nbio->bi_sector, nbio->bi_size);
-
-		/* mark the new bio as being wrapped */
-		flags.is_part = 1;
-		nbio->bio_size |= flags.u8;
-
-		/* associate the new bio with the container */
-		nbio->bi_private = sreq;
-
-		/* collect the total number */
+		if (DEBUG_SPLIT_PRINTK) printk(" CB[%d](%p, %p, %p)\n", ret_count, bgrp, nbio, opaque);
+		ops->submit_part(bgrp, nbio, opaque);
 		ret_count ++;
-
-		/* add the new bio to the list */
-		if (0) printk(" CB[%p](%p, %p, %p)\n", cb, sreq, nbio, opaque);
-		cb(sreq, nbio, opaque);
 	}
 
-	WARN_ON(ret_count != num_bios);
+	WARN_ON(ret_count != max_nbios);
 
 	return ret_count;
 }
 
-
-static void __bio_endio(struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts)
-{
-	int rw = bio_data_dir(bio);
-	unsigned int size = td_bio_get_byte_size(bio);
-	struct gendisk *disk = td_engine_device(eng)->os.disk;
-
-	if (disk) {
-#if defined(part_stat_lock)
-		int cpu = part_stat_lock();
-		struct hd_struct *part = disk_map_sector_rcu(disk, bio->bi_sector);
-		if (rw) {
-			part_stat_add(cpu, part, sectors[rw], size/512);
-		}
-		else {
-			part_stat_add(cpu, part, sectors[rw], size/512);
-		}
-		part_stat_add(cpu, part, ticks[rw], td_cycles_to_msec(ts));
-		part_stat_inc(cpu, part, ios[rw]);
-#else
-		if (rw) {
-			disk_stat_add(disk, sectors[rw], size/512);
-		}
-		else {
-			disk_stat_add(disk, sectors[rw], size/512);
-		}
-		disk_stat_inc(disk, ios[rw]);
-		disk_stat_add(disk, ticks[rw], td_cycles_to_msec(ts));
-#endif
-	}
-
-	td_engine_endio(eng, bio, result);
-
-	/* update the request latency */
-	if (rw == WRITE)
-		td_eng_latency_end(&eng->td_bio_latency, bio,
-				"req-wr-latency",
-				&eng->td_counters.write.req);
-	else
-		td_eng_latency_end(&eng->td_bio_latency, bio,
-				"req-rd-latency",
-				&eng->td_counters.read.req);
-}
-
-void td_bio_endio(struct td_engine *eng, td_bio_ref bio, int result, cycles_t ts)
-{
-	if (unlikely (td_bio_is_part(bio))) {
-		return td_biogrp_complete_part(eng, bio, result, ts);
-	}
-	
-	td_eng_trace(eng, TR_BIO, "BIO:end:bio   ", (uint64_t)bio);
-	
-	/* Clear any flags */
-	bio->bio_size -= bio->bio_size & 0x00FF;
-
-	__bio_endio(eng, bio, result, ts);
-
-	td_eng_trace(eng, TR_BIO, "BIO:end:result", result);
-
-	/* update the counter */
-	eng->td_total_bios++;
-}
 

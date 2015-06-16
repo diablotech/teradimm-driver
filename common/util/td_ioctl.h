@@ -96,6 +96,33 @@ struct __packed td_ioctl_conf {
 		+ TD_CONF_ENTRIES_SIZE(entries) )
 
 
+/*
+ * This is the counter entry we use for ALL counter related ioctls, similar to
+ * conf ioctls
+ */
+struct __packed td_ioctl_counter_entry {
+	uint32_t type;
+	union {
+		struct {
+			uint32_t var:16;        /* [15:0] var type */
+			uint32_t id:16;         /* [32:16] id      */
+		} part;
+		uint32_t var;
+	};
+	uint64_t val;
+};
+#define TD_COUNTER_ENTRIES_SIZE(_n) (_n * sizeof(struct td_ioctl_counter_entry))
+
+struct __packed td_ioctl_counters {
+	uint32_t  count;
+	struct td_ioctl_counter_entry entries[0];
+};
+
+/** return size of buffer needed to allocate enough space for some number of entries */
+#define TD_IOCTL_COUNTER_SIZE(entries) (sizeof(struct td_ioctl_counters) \
+		+ TD_COUNTER_ENTRIES_SIZE(entries) )
+
+
 /* ioctls for /dev/td-control character device */
 
 struct __packed td_ioctl_devgroup_list {
@@ -134,18 +161,18 @@ struct __packed td_ioctl_devgroup_conf {
 		+ TD_CONF_ENTRIES_SIZE(entries) )
 
 struct td_ioctl_devgroup_counter_entry {
-	uint32_t type; /* !< use enum td_devgroup_counter_type */
+	uint16_t type; /* !< use enum td_devgroup_counter_type */
+	uint16_t worker; /* !< which worker */
 	uint32_t var;  /* !< use enum td_devgroup_(...)_counter
 			* from td_defs.h
 			*/
-	uint32_t worker;
 	uint64_t val;
 };
 
 struct __packed td_ioctl_devgroup_counters {
 	char     group_name[TD_DEVGROUP_NAME_MAX];
 	uint32_t count;
-	struct td_ioctl_devgroup_counter_entry entries[0];
+	struct td_ioctl_counter_entry entries[0];
 };
 /** return size of buffer needed to allocate enough space for some number of entries */
 #define TD_IOCTL_DEVGROUP_COUNTER_SIZE(entries) (sizeof(struct td_ioctl_devgroup_counters) \
@@ -168,6 +195,7 @@ struct __packed td_ioctl_device_create {
 	char       phys_slot_name[TD_DEVICE_SLOT_NAME_MAX];
 	uint64_t   phys_mem_base;
 	uint64_t   phys_mem_size;
+	uint64_t   phys_mem_avoid_mask;
 	uint32_t   irq_num;
 	uint16_t   memspeed;
 	uint16_t   cpu_socket;
@@ -177,26 +205,6 @@ struct __packed td_ioctl_device_name {
 	char       dev_name[TD_DEVICE_NAME_MAX];
 };
 
-
-/* ioctls targetting an individual device, ie /dev/tdX-ctl */
-
-/* ioctls targetting an individual device, ie /dev/tdX-ctl */
-struct td_ioctl_device_counter_entry {
-	uint32_t type; /* !< use enum td_device_counter_type from td_defs.h */
-	uint32_t var;  /* !< use enum td_dev_(gen, token, misc)_counter
-			* from td_defs.h
-			*/
-	uint64_t val;
-};
-
-struct __packed td_ioctl_device_counters {
-	uint32_t  count;
-	struct td_ioctl_device_counter_entry entries[0];
-};
-/** return size of buffer needed to allocate enough space for some number of entries */
-#define TD_IOCTL_DEVICE_COUNTER_SIZE(entries) \
-		( sizeof(struct td_ioctl_device_counters) \
-		+ (entries) * sizeof(struct td_ioctl_device_counter_entry) )
 
 struct __packed td_ioctl_device_stats {
 	struct {
@@ -211,68 +219,6 @@ struct __packed td_ioctl_device_stats {
 		uint64_t  max_concurrent_completed;/* !< maximum concurrent requests */
 		uint64_t  split_req_cnt;           /* !< number of requests split into muliple requests */
 	} read, write, control;
-};
-
-
-struct __packed td_ioctl_device_counters_internal {
-	union {
-		uint64_t data[ 3 * TD_DEV_GEN_COUNT_MAX + /* 3 is for read, write, control */
-				   TD_DEV_TOKEN_COUNT_MAX +
-				   TD_DEV_MISC_COUNT_MAX    ];
-		struct {
-			struct {
-				struct td_io_latency_counters {
-					uint64_t latency;          /* !< latest random latency (nsec) */
-					uint64_t lat_acumu;        /* !< accumulated latencies */
-					uint64_t lat_cnt;          /* !< number accumulated latencies */
-				} hw, req;
-			} read, write, control;
-
-			struct {
-				uint64_t  timedout_cnt;            /* !< number of tokens timed out */
-				uint64_t  failed_cnt;              /* !< number of failed tokens */
-				uint64_t  resets_cnt;              /* !< number of resets issued (after timeout) */
-				uint64_t  retries_cnt;             /* !< number of retries issued (after reset) */
-				uint64_t  recovered_cnt;           /* !< number of recovered errors (through retries) */
-				uint64_t  free_list_cnt;           /* !< number of tokens on free list */
-				uint64_t  active_list_cnt;         /* !< number of tokens on active list */
-				uint64_t  timedout_list_cnt;       /* !< number of tokens on timedout list */
-				uint64_t  resumable_list_cnt;      /* !< number of tokens on resumable list */
-				uint64_t  partial_read_list_cnt;   /* !< number of tokens on partial read list */
-				uint64_t  offset_error_cnt;        /* !< number of command with offset errors */
-				uint64_t  data_ecc_error_cnt;      /* !< number of command ecc errors on write data  */
-				uint64_t  cmd_ecc_error_cnt;       /* !< number of command ecc errors on cmd data  */
-				uint64_t  weptimeout_cnt;          /* !< number of commands with hw errors */
-				uint64_t  weptimeout_recovered_cnt;  /* !< number of commands with hw errors */
-				uint64_t  badxsum_cnt;             /* !< number of commands with bad checksums */
-				uint64_t  badxsum_recovered_cnt;     /* !< number of commands with bad checksums */
-				uint64_t  cmd_error_cnt;           /* !< number of commands with hw errors */
-				uint64_t  seq_dup_cnt;             /* !< number of commands with sequence ooo */
-				uint64_t  seq_ooo_cnt;             /* !< number of commands with sequence dup */
-				uint64_t  seq_replay_cnt;          /* !< number of commands replayed for missing sequence */
-				uint64_t  forced_seq_advance;      /* !< number of times sequence had to be advanced */
-				uint64_t  sec_ignore_retry;        /* !< number of tiems seq made us ignore failures */
-				uint64_t  double_sec_replay;       /* !< number of times a SEC was replayed on both tokens */
-				uint64_t  lost_refresh_cnt;        /* !< number of times a lost token had to be refreshed */
-				uint64_t  noupdate_cnt;            /* !< number of inflight command */
-				uint64_t  noupdate_limit_reached;   /* !< number of times the number of inflight/not-updated tokens exceeded limit */
-			} token;
-
-			struct {
-				uint64_t  read_modify_write_cnt;   /* !< number of read-modify-write operations */
-				uint64_t  deallocation_error_cnt;  /* !< number of failed deallocations */
-				uint64_t  deallocation_timeout_cnt;/* !< number of timedout deallocations */
-				uint64_t  rdbuf_progress_timeout_cnt; /* !< number of RDBUF progress timeouts */
-				uint64_t  rdbuf_matching_timeout_cnt; /* !< number of RDBUF matching timeouts */
-				uint64_t  orphan_read_buffer_cnt;  /* !< number of recovered lost read buffers */
-				uint64_t  fwstatus_sema_success_cnt;  /* !< number of flips of the fw status semaphore */
-				uint64_t  fwstatus_sema_misses_cnt;  /* !< number of misses on fw status semaphore */
-				uint64_t  fwstatus_sema_timeout_cnt;  /* !< number of timeouts on fw status semaphore */
-				uint64_t  fwstatus_sema_timeout_max_cnt;  /* !< number of times the timeout max was reached */
-				uint64_t  rdbuf_marker_error_cnt; /* !< number of misses on readbuf metadata */
-			} misc;
-		};
-	};
 };
 
 /* HACK: remove later */
@@ -471,16 +417,6 @@ struct __packed td_ioctl_device_ecc_counters {
 
 /* ioctls for managing TR devices */
 
-#ifdef CONFIG_TERADIMM_DEPREICATED_RAID_CREATE_V0
-/** used with TD_IOCTL_RAID_CREATE/TD_IOCTL_RAID_STAT */
-struct __packed td_ioctl_raid_device_create_v0 {
-	char        raid_name[TD_DEVICE_NAME_MAX];  /* !< name, like tra */
-	uint8_t     raid_uuid[TR_UUID_LENGTH];                  /* !< UUID of device */
-	uint32_t    raid_level;                     /* !< use enum td_raid_level */
-	uint32_t    raid_members_count;             /* !< number of TD devices */
-};
-#endif
-
 struct __packed td_ioctl_raid_create {
 	char        raid_name[TD_DEVICE_NAME_MAX];  /* !< name, like tra */
 	uint8_t     raid_uuid[TR_UUID_LENGTH];                  /* !< UUID of device */
@@ -506,7 +442,8 @@ struct __packed td_ioctl_raid_member_entry {
 };
 
 struct __packed td_ioctl_raid_state {
-	enum td_raid_state_type    state;
+	enum td_raid_dev_state      dev_state;
+	enum td_raid_run_state      run_state;
 	uint32_t  members_count;             /* !< number of TD devices */
 	uint32_t  control_users;    /* !< number of users of the control interface */
 	uint32_t  block_users;      /* !< number of users of the block interface */
@@ -593,7 +530,7 @@ struct __packed td_ioctl_raid_state {
 /** ioctl used to get device counters */
 #define TD_IOCTL_DEVICE_GET_STATS       _IOR(TERADIMM_IOC, 28, struct td_ioctl_device_stats)
 
-#define TD_IOCTL_DEVICE_GET_RDBUFS       _IOR(TERADIMM_IOC, 29, struct td_ioctl_device_counters)
+#define TD_IOCTL_DEVICE_GET_RDBUFS       _IOR(TERADIMM_IOC, 29, struct td_ioctl_counters)
 
 #define TD_IOCTL_DEVICE_TRACE_GET_CONF _IOR(TERADIMM_IOC, 31, struct td_ioctl_device_trace_config)
 
@@ -644,8 +581,8 @@ struct __packed td_ioctl_raid_state {
 #define TD_IOCTL_DEVICE_STOP_BIO  _IO(TERADIMM_IOC, 56)
 #define TD_IOCTL_DEVICE_START_BIO _IO(TERADIMM_IOC, 57)
 
-#define TD_IOCTL_DEVICE_GET_COUNTERS       _IOR(TERADIMM_IOC, 58, struct td_ioctl_device_counters)
-#define TD_IOCTL_DEVICE_GET_ALL_COUNTERS       _IOR(TERADIMM_IOC, 59, struct td_ioctl_device_counters)
+#define TD_IOCTL_DEVICE_GET_COUNTERS       _IOR(TERADIMM_IOC, 58, struct td_ioctl_counters)
+#define TD_IOCTL_DEVICE_GET_ALL_COUNTERS       _IOR(TERADIMM_IOC, 59, struct td_ioctl_counters)
 
 /** ioctl used to query the configuration of a device group */
 #define TD_IOCTL_DEVGROUP_GET_CONF  _IOWR(TERADIMM_IOC, 60, struct td_ioctl_conf)
@@ -657,11 +594,6 @@ struct __packed td_ioctl_raid_state {
 #define TD_IOCTL_DEVGROUP_SET_CONF  _IOW(TERADIMM_IOC, 62, struct td_ioctl_conf)
 
 /** ioctls used with TR device management */
-
-#ifdef CONFIG_TERADIMM_DEPREICATED_RAID_CREATE_V0
-/* called on /dev/td-control to create a new unconfigured /dev/trX device */
-#define TD_IOCTL_RAID_CREATE_V0 _IOWR(TERADIMM_IOC, 70, struct td_ioctl_raid_device_create_v0)
-#endif
 
 #define TD_IOCTL_RAID_CREATE _IOWR(TERADIMM_IOC, 70, struct td_ioctl_raid_create)
 
@@ -680,23 +612,32 @@ struct __packed td_ioctl_raid_state {
 /* called on /dev/trX, removing membmers */
 #define TD_IOCTL_RAID_DEL_MEMBER _IOW(TERADIMM_IOC, 74, struct td_ioctl_device_list)
 
+
+
 /* called on /dev/trX, returns member list
  * Driver populates the buffer provided with NUL separated entries.
  * When called with an undersized buf_size, -ETOOSMALL is returned and
  * buf_size set to the minimum required buffer size to return all entries. */
 #define TD_IOCTL_RAID_GET_MEMBER_LIST _IOWR(TERADIMM_IOC, 75, struct td_ioctl_device_list)
+#define TD_IOCTL_RAID_GET_MEMBER_LIST _IOWR(TERADIMM_IOC, 75, struct td_ioctl_device_list)
 
 /* called on /dev/trX, returns status, info, and counters */
 #define TD_IOCTL_RAID_GET_INFO          _IOWR(TERADIMM_IOC, 76, struct td_ioctl_raid_info)
 #define TD_IOCTL_RAID_GET_STATE         _IOWR(TERADIMM_IOC, 77, struct td_ioctl_raid_state)
-#define TD_IOCTL_RAID_GET_COUNTERS      _IOWR(TERADIMM_IOC, 78, struct td_ioctl_device_counters)
-#define TD_IOCTL_RAID_GET_ALL_COUNTERS  _IOWR(TERADIMM_IOC, 79, struct td_ioctl_device_counters)
+#define TD_IOCTL_RAID_GET_COUNTERS      _IOWR(TERADIMM_IOC, 78, struct td_ioctl_counters)
+#define TD_IOCTL_RAID_GET_ALL_COUNTERS  _IOWR(TERADIMM_IOC, 79, struct td_ioctl_counters)
 #define TD_IOCTL_RAID_GET_CONF		_IOWR(TERADIMM_IOC, 80, struct td_ioctl_conf)
 #define TD_IOCTL_RAID_GET_ALL_CONF	_IOWR(TERADIMM_IOC, 81, struct td_ioctl_conf)
 #define TD_IOCTL_RAID_SET_CONF	 	_IOWR(TERADIMM_IOC, 82, struct td_ioctl_conf)
 
+/* called on /dev/trX, changing membmers */
+#define TD_IOCTL_RAID_FAIL_MEMBER _IOW(TERADIMM_IOC, 83, struct td_ioctl_device_name)
+
+/* This is a temporary one */
+#define TD_IOCTL_RAID_METASAVE           _IO(TERADIMM_IOC, 183)
+
 /* called on /dev/trX, starts resync process on DEGRADED device */
-#define TD_IOCTL_RAID_RESYNC __future__
+#define TD_IOCTL_RAID_RESYNC              _IOWR(TERADIMM_IOC, 83, struct td_ioctl_conf /* unused */)
 
 
 #ifdef __KERNEL__
@@ -717,7 +658,7 @@ int td_ioctl_device_cmd_pt(struct td_device *dev,
 int td_ioctl_device_get_stats(struct td_device *dev,
 		struct td_ioctl_device_stats *stats);
 int td_ioctl_device_get_counters(struct td_device *dev,
-		struct td_ioctl_device_counters *cntrs, bool fill_mode);
+		struct td_ioctl_counters *cntrs, bool fill_mode);
 
 int td_ioctl_device_get_rdbufs(struct td_device *dev,
 		struct td_ioctl_device_rdbufs *rb);
@@ -777,6 +718,8 @@ int td_ioctl_control_mon_rate( struct td_ioctl_monitor_rate *mr);
 
 int td_ioctl_raid_get_conf(struct td_raid *dev,
                            struct td_ioctl_conf *conf, bool fill_mode);
+
+int td_ioctl_raid_resync(struct td_raid *dev);
 
 #endif
 

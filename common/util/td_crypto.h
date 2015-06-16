@@ -84,4 +84,16 @@ int td_sha1_update(struct td_sha1_state*, void*, uint len);
 int td_sha1_final(struct td_sha1_state*, uint8_t* out);
 int td_sha1_free(struct td_sha1_state*);
 
+
+/*
+ * For Checking signatures
+ */
+struct td_rsa_pub_key {
+       char* td_pub_mod;
+       char* td_pub_exp;
+};
+
+extern struct td_rsa_pub_key td_rsa_pub_keys[];
+
+
 #endif

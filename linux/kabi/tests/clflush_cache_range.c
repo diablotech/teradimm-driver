@@ -1,5 +1,4 @@
-#define __KERNEL__
-#include <linux/kconfig.h>
+#include <linux/kernel.h>
 #include <linux/bio.h>
 #include <linux/slab.h>
 
@@ -7,7 +6,7 @@
 #define clflush_cache_range(_a,_b) UNEXPORTED(_a,_b)
 #endif
 
-void foo() {
+void foo(void) {
 	void *ptr = 0;
 	unsigned int size = 0;
 

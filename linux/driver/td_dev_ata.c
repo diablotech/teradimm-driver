@@ -63,50 +63,38 @@
 #include "td_eng_hal.h"
 #include "td_ata_cmd.h"
 #include "td_params.h"
+#include "td_dev_scsi.h"
 
-#if 0
-static unsigned char t10[] =     "ATA    ";
-static unsigned char vendor[] =  " Diablo            ";
-static unsigned char model[] =   "TeraSIMM";
-static unsigned char serial[] =  "314159  ";
-static unsigned char version[] = " 1.6";
-#endif
-
-static int td_dev_ata16_notok(sg_io_hdr_t *hdr)
-{
-	/*FIXME: What is the correct return on a failed diablo command? */
-
-	hdr->status = 0x40; /* Task aborted */
-	hdr->masked_status = COMMAND_TERMINATED;
-	hdr->info = 0;
-	hdr->host_status = 0;
-	hdr->driver_status = 0x08;
-	hdr->sb_len_wr = 0; /* no sense buffer */
-
-	return 0;
-}
-
+/* the below functions are typically used via the ATA12 / ATA16 pass through
+ * SCSI command, and as such they operate directly on the structures.  for a
+ * clearer separation it would be useful to implement the SATL (SCSI to ATA
+ * Translation Layer). */
 
 /* Get the status buffer from the get_params call and return the result in the
  * sg_io_hdr structure */
-static int td_dev_ata_check_sb (struct td_dev_ata_state* state)
+static int td_dev_ata_check_sb (struct td_scsi_cmd* cmd)
 {
 	int rc;
-	sg_io_hdr_t *hdr = state->hdr;
 	struct td_ucmd *g_params;
 	struct page *p;
 	struct td_param_page0_monet_map *monet[2];
-	unsigned char *sb;
+	unsigned char *sb = cmd->sense;
 	struct td_ata_pt_resp *resp;
 	int length = sizeof(struct td_ata_pt_resp) + 8;
 	int rm = 0; /* return monet */
-	int chk_cond = state->ata_pt_cmd->ata_cmd[2] & 0x20;
+	struct td_ata_pt_cmd *ata_pt_cmd = (struct td_ata_pt_cmd *)cmd->request;
+	int chk_cond = ata_pt_cmd->ata_cmd[2] & 0x20;
+	struct td_device *dev = td_device_from_os(cmd->odev);
+	struct td_engine *eng = td_device_engine(dev);
 
 	rc = -ENOMEM;
 	g_params = kzalloc (sizeof(struct td_ucmd), GFP_KERNEL);
 	if (!g_params) {
 		/* Assume ata command failed? */
-		td_dev_ata16_notok(state->hdr);
+		cmd->status = SAM_STAT_TASK_ABORTED; /* Task aborted */
+		rc = 0x04;
+		cmd->sense_len = 0; /* no sense buffer */
+
 		goto no_mem;
 	}
 
@@ -116,13 +104,19 @@ static int td_dev_ata_check_sb (struct td_dev_ata_state* state)
 
 	p = alloc_page(GFP_KERNEL);
 	g_params->ioctl.data = p;
-	rc = td_eng_cmdgen_chk(state->eng, get_params, &g_params->ioctl.cmd[0], 1);
+	rc = td_eng_cmdgen_chk(eng, get_params, &g_params->ioctl.cmd[0], 1);
 	if (rc) {
 		/* Assume ata command failed? */
-		td_dev_ata16_notok(state->hdr);
+		cmd->status = SAM_STAT_TASK_ABORTED; /* Task aborted */
+		rc = 0x04;
+		cmd->sense_len = 0; /* no sense buffer */
+
 		goto paramsgen_fail;
 	}
 
+	/* this looks strange as we did get params on page 1.  try to capture
+	 * a trace */
+	WARN_ON(1);
 	monet[0] = &((struct td_param_page0_map_161*)p)->mMonetParams[0];
 	monet[1] = &((struct td_param_page0_map_161*)p)->mMonetParams[1];
 
@@ -131,33 +125,21 @@ static int td_dev_ata_check_sb (struct td_dev_ata_state* state)
 	 * data. */
 	if ((monet[0]->d2h_reg_3.u8[3] & 0x20) >> 5 ^
 			(monet[0]->d2h_reg_3.u8[3] & 0x01)) {
-		hdr->masked_status = CHECK_CONDITION;
-		hdr->status = monet[0]->d2h_reg_3.u8[3];
+		cmd->status = monet[0]->d2h_reg_3.u8[3];
 	}
 	else if ((monet[1]->d2h_reg_3.u8[3] & 0x20) >> 5 ^
 			(monet[1]->d2h_reg_3.u8[3] & 0x01)) {
-		hdr->masked_status = CHECK_CONDITION;
-		hdr->status = monet[1]->d2h_reg_3.u8[3];
+		cmd->status = monet[1]->d2h_reg_3.u8[3];
 		rm = 1;
 	}
 	else if(!chk_cond) {
-		hdr->status = 0x0;
-		hdr->masked_status = 0x0;
-		rc =  0;
+		cmd->status = SAM_STAT_GOOD;
+		rc = 0;
+
 		goto no_err;
 	}
 
-	/*No errors, but check condition means return sb. */
-	hdr->status = 0x02;
-	hdr->masked_status = CHECK_CONDITION;
-
-	hdr->info = 0;
-	hdr->host_status = 0;
-	hdr->driver_status = 0x08;
-	hdr->sb_len_wr = length;
-
-	sb = kmalloc(length, GFP_KERNEL);
-	memset(sb, 0, length);
+	/* No errors, but check condition means return sb. */
 	sb[0] = 0x72;
 	sb[7] = 0x0E;
 	resp = (struct td_ata_pt_resp*)(sb + 8);
@@ -187,10 +169,10 @@ static int td_dev_ata_check_sb (struct td_dev_ata_state* state)
 		resp->lba_m = monet[rm]->d2h_reg_2.u8[3];
 		resp->lba_h = monet[rm]->d2h_reg_3.u8[1];
 	}
-	rc = copy_to_user(hdr->sbp, sb, length);
-	if (rc)
-		rc = -ENOMEM;
-	kfree(sb);
+
+	cmd->status = SAM_STAT_CHECK_CONDITION;
+	cmd->sense_len = length;
+	rc = DRIVER_SENSE;
 
 	return rc;
 
@@ -204,52 +186,26 @@ no_err:
 	return rc;
 
 }
-#if 0
-static int td_dev_ata16_ok(sg_io_hdr_t *hdr) {
-	int ret;
-	unsigned char *sb;
-	struct td_ata_pt_resp *resp;
-	int length = sizeof(struct td_ata_pt_resp) + 8;
 
-	hdr->status = 0x02;
-	hdr->masked_status = CONDITION_GOOD;
-	hdr->info = 0;
-	hdr->host_status = 0;
-	hdr->driver_status = 0x08;
-	hdr->sb_len_wr = length;
-
-	sb = kmalloc(length, GFP_KERNEL);
-	memset(sb, 0, length);
-	sb[0] = 0x72;
-	sb[7] = 0x0E;
-	resp = (struct td_ata_pt_resp*)(sb + 8);
-
-	resp->desc = 0x09;
-	resp->len = 0x0C;
-	resp->lba_m = 0x4f;
-	resp->lba_h = 0xc2;
-	resp->status = 0x50;
-	ret = copy_to_user(hdr->sbp, sb, length);
-
-	kfree(sb);
-
-	return ret;
-}
-#endif
-static int td_dev_ata_send_cmds(struct td_dev_ata_state *state,
-		struct td_ucmd *ucmd[2])
+static int td_dev_ata_send_cmds(struct td_scsi_cmd *cmd,
+		struct td_ucmd *ucmd[2], int data_from_device,
+		int data_to_device)
 {
 	int rc = -ENOMEM;
 	struct page *p[2];
 	int size;
+	struct td_device *dev = td_device_from_os(cmd->odev);
+	struct td_engine *eng = td_device_engine(dev);
+
+	if (!td_state_can_accept_requests(eng))
+		goto denied;
 
 	ucmd[0] = kzalloc (sizeof(*ucmd[0]), GFP_KERNEL);
 	if (!ucmd[0])
 		goto no_mem0;
 
-
-	ucmd[0]->ioctl.data_len_from_device = state->data_from_device;
-	ucmd[0]->ioctl.data_len_to_device = state->data_to_device;
+	ucmd[0]->ioctl.data_len_from_device = data_from_device;
+	ucmd[0]->ioctl.data_len_to_device = data_to_device;
 
 	p[0] = alloc_page(GFP_KERNEL);
 	ucmd[0]->ioctl.data = p[0];
@@ -258,22 +214,21 @@ static int td_dev_ata_send_cmds(struct td_dev_ata_state *state,
 	if (!ucmd[1])
 		goto no_mem1;
 
-	ucmd[1]->ioctl.data_len_from_device = state->data_from_device;
-	ucmd[1]->ioctl.data_len_to_device = state->data_to_device;
+	ucmd[1]->ioctl.data_len_from_device = data_from_device;
+	ucmd[1]->ioctl.data_len_to_device = data_to_device;
 
 	p[1] = alloc_page(GFP_KERNEL);
 	ucmd[1]->ioctl.data = p[1];
 
-	size = state->data_from_device;
+	size = data_from_device;
 
-	if(state->data_to_device)
-		size = state->data_to_device;
+	if(data_to_device)
+		size = data_to_device;
 
-
-	rc = td_eng_cmdgen_chk(state->eng, ata, (&ucmd[0]->ioctl.cmd[0]),
-			state->ata, 0, size);
-	rc |= td_eng_cmdgen_chk(state->eng, ata, (&ucmd[1]->ioctl.cmd[0]),
-			state->ata, 1, size);
+	rc = td_eng_cmdgen_chk(eng, ata, (&ucmd[0]->ioctl.cmd[0]),
+			cmd->request, 0, size);
+	rc |= td_eng_cmdgen_chk(eng, ata, (&ucmd[1]->ioctl.cmd[0]),
+			cmd->request, 1, size);
 
 	/* If either command is not generated, fail out.*/
 	if (rc) {
@@ -291,33 +246,19 @@ static int td_dev_ata_send_cmds(struct td_dev_ata_state *state,
 	if (rc)
 		goto bail_setup1;
 
-	if(state->data_to_device) {
-		rc = copy_from_user(ucmd[0]->data_virt, state->hdr->dxferp,
-			state->hdr->dxfer_len);
-		if (rc) {
-			rc = -ECOMM;
-			goto cfail0;
-		}
-		rc = copy_from_user(ucmd[1]->data_virt, state->hdr->dxferp,
-			state->hdr->dxfer_len);
-		if (rc) {
-			rc = -ECOMM;
-			goto cfail1;
-		}
+	if(data_to_device) {
+		memcpy(ucmd[0]->data_virt, cmd->dxferp, cmd->dxfer_len);
+		memcpy(ucmd[1]->data_virt, cmd->dxferp, cmd->dxfer_len);
 	}
 	/*  Ready!? */
 	td_ucmd_ready(ucmd[0]);
 	td_ucmd_ready(ucmd[1]);
 
-	/*  a reference for the execution thread */
-	td_ucmd_get(ucmd[0]);
-	td_ucmd_get(ucmd[1]);
-
-	td_enqueue_ucmd(state->eng, ucmd[0]);
-	td_enqueue_ucmd(state->eng, ucmd[1]);
+	td_enqueue_ucmd(eng, ucmd[0]);
+	td_enqueue_ucmd(eng, ucmd[1]);
 
 	/* Poke the beast! */
-	td_device_poke(td_engine_device(state->eng));
+	td_device_poke(dev);
 
 	/* And now we play the waiting game. */
 	rc = td_ucmd_wait(ucmd[0]);
@@ -344,7 +285,7 @@ static int td_dev_ata_send_cmds(struct td_dev_ata_state *state,
 	}
 
 	/* FIXME: Check return.. sb will be set one way or another..*/
-	rc = td_dev_ata_check_sb(state);
+	rc = td_dev_ata_check_sb(cmd);
 
 	return rc;
 
@@ -352,11 +293,11 @@ cmd1_fail:
 cmd0_fail:
 bail_running1:
 bail_running0:
-cfail1:
-cfail0:
 bail_setup1:
 bail_setup0:
-	td_dev_ata16_notok(state->hdr);
+	cmd->status = SAM_STAT_TASK_ABORTED; /* Task aborted */
+	rc = 0x08;
+
 	return rc;
 
 ucmdgen_fail:
@@ -367,16 +308,21 @@ no_mem1:
 	kfree(ucmd[0]);
 no_mem0:
 	return -ENOMSG;
+denied:
+	return -EIO;
 }
-static int td_dev_ata16_generic(struct td_dev_ata_state *state) {
+
+int td_dev_ata16_generic(struct td_scsi_cmd *cmd,
+		int data_from_device, int data_to_device) {
 	struct td_ucmd *ucmd[2];
 
-	void *dx = state->hdr->dxferp;
+	void *dx = NULL;
 	union td_ata_identify *id[2];
 	int rc = 0;
 
+	dx = cmd->dxferp;
 
-	rc = td_dev_ata_send_cmds(state, ucmd);
+	rc = td_dev_ata_send_cmds(cmd, ucmd, data_from_device, data_to_device);
 	if (unlikely(-ENOMSG == rc))
 		goto nomem;
 
@@ -390,11 +336,12 @@ static int td_dev_ata16_generic(struct td_dev_ata_state *state) {
 	 * sometimes..
 	id[0]->chksum = td_ata16_chksum((char*)id[0]);
 	*/
+
+	memcpy(dx, id[0], data_from_device);
+	cmd->resid = cmd->dxfer_len - data_from_device - data_to_device;
+
 	rc = 0;
-	if (state->data_from_device)
-		rc = copy_to_user(dx, id[0], state->data_from_device);
-	if (rc)
-		rc = -ENOMEM;
+
 	return rc;
 
 send_fail:
@@ -407,10 +354,11 @@ nomem:
 
 void dump_spd(struct td_engine *eng, uint8_t *spd);
 
-static int td_dev_ata_ident(struct td_dev_ata_state *state)
+int td_dev_ata_ident(struct td_scsi_cmd *cmd)
 {
-	struct td_engine *eng = state->eng;
-	union td_ata_identify response;
+	struct td_device *dev = td_device_from_os(cmd->odev);
+	struct td_engine *eng = td_device_engine(dev);
+	union td_ata_identify *response = (union td_ata_identify *)cmd->dxferp;
 	int rc = 0;
 	struct td_ucmd *ucmd;
 	struct page *p;
@@ -418,7 +366,10 @@ static int td_dev_ata_ident(struct td_dev_ata_state *state)
 	struct {
 		uint8_t hdr[8];
 		struct td_ata_pt_resp ata;
-	} pt_status;
+	} *pt_status = cmd->sense;
+
+	if (!td_state_can_accept_requests(eng))
+		goto denied;
 
 	rc = -ENOMEM;
 
@@ -441,7 +392,6 @@ static int td_dev_ata_ident(struct td_dev_ata_state *state)
 	rc = td_ucmd_run(ucmd, eng);
 	if (rc) goto ucmd_fail;
 
-	memset(&response, 0, sizeof(response));
 	page_map = ucmd->data_virt;
 
 	if (td_eng_conf_hw_var_get(eng, SPD)) {
@@ -450,78 +400,77 @@ static int td_dev_ata_ident(struct td_dev_ata_state *state)
 		int i;
 
 		// SPD has 18 bytes for "product type", starting at 128
-		for (i = 0; i < min(sizeof(response.model), 18UL); i++)
-				response.model[i^1] = spd[128+i];
+		for (i = 0; i < min(sizeof(response->model), 18UL); i++)
+				response->model[i^1] = spd[128+i];
 		for (i = 0; i < 10; i++) {
-			response.serial[(9-i)^1] = (serial % 10) + '0';
+			response->serial[(9-i)^1] = (serial % 10) + '0';
 			serial /= 10;
 		}
 	} else {
-		strncpy(response.model, "DT L                      ", sizeof(response.model));
-		strncpy(response.serial, "0000000000", sizeof(response.serial));
+		strncpy(response->model, "DT L                      ", sizeof(response->model));
+		strncpy(response->serial, "0000000000", sizeof(response->serial));
 	}
 
 	rc = 0;
-	response.fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_MAJOR) >> 8) + '@';
-	response.fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_MAJOR) && 0x00ff) + '0';
-	response.fw[rc++ ^ 1] = '.';
-	response.fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_MINOR) / 10) % 10 + '0';
-	response.fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_MINOR) / 10) % 10 + '0';
-	response.fw[rc++ ^ 1] = '.';
-	response.fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_PATCH) / 10) % 10 + '0';
-	response.fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_PATCH)       % 10) + '0';
+	response->fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_MAJOR) >> 8) + '@';
+	response->fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_MAJOR) && 0x00ff) + '0';
+	response->fw[rc++ ^ 1] = '.';
+	response->fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_MINOR) / 10) % 10 + '0';
+	response->fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_MINOR) / 10) % 10 + '0';
+	response->fw[rc++ ^ 1] = '.';
+	response->fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_PATCH) / 10) % 10 + '0';
+	response->fw[rc++ ^ 1] = (td_eng_conf_hw_var_get(eng, VER_PATCH)       % 10) + '0';
 	rc = 0;
 
-	response.size = td_engine_device(eng)->os.block_params.capacity >> SECTOR_SHIFT;
+	response->size = td_engine_device(eng)->os.block_params.capacity >> SECTOR_SHIFT;
 
 	/* w2: 0x8C37 for ATA-8*/
-	response.w[2] = 0x8C37;
+	response->w[2] = 0x8C37;
 
 	/* w47: 0x80 is a magic number, 0x01 is the max number of logical sectors */
-	response.w[47+0] = 0x8001;
+	response->w[47+0] = 0x8001;
 
 
 	/* w49 sata requires bit 11 & 10 to be set. Bit 12 = ident */
-	response.w[49] = 0x1C00;
-
+	response->w[49] = 0x1C00;
 
 	/* w50 b14 shall be 1 */
-	response.w[50] = 0x4000;
+	response->w[50] = 0x4000;
 
-	/* w53: word 88 (bit2) and w70 - w64 (bit1) are valresponse.*/
-	response.w[53] = 0x0006;
+	/* w53: word 88 (bit2) and w70 - w64 (bit1) are valresponse->*/
+	response->w[53] = 0x0006;
 
 	/* w63 Bit 0-2 are set for SATA */
-	response.w[63] = 0; //0x0007;
+	response->w[63] = 0; //0x0007;
 
 	/* w64 Bit 0-1 are set for SATA */
-	response.w[64] = 0; //0x0003;
+	response->w[64] = 0; //0x0003;
 
 	/* w65 - w68 are set to 0x0078 for SATA */
-	response.w[65] = 0x0078; /* 120ms ("Word" 65) */
-	response.w[66] = 0x0078;
-	response.w[67] = 0x0078;
-	response.w[68] = 0x0078;
+	response->w[65] = 0x0078; /* 120ms ("Word" 65) */
+	response->w[66] = 0x0078;
+	response->w[67] = 0x0078;
+	response->w[68] = 0x0078;
 
 	/* w76 Bit2 = sata2, Bit1 = sata1 */
-	response.w[76] = 0; //0x0006;
+	response->w[76] = 0; //0x0006;
 
 	/* w78 in order*/
-	response.w[78] = 0; //0x1000;
+	response->w[78] = 0; //0x1000;
 
 	/* w79 in order enabled.*/
-	response.w[79] = 0x0001; // 0x1000;
+	response->w[79] = 0x0001; // 0x1000;
 
 	/* w80 is major version: ATA8-ACS */
-	response.w[80] = 0x01F0;
+	response->w[80] = 0x01F0;
 	/* w81 is minor version: ACS-2 T13/2015-D revision 3 */
-	response.w[81] = 0x0110;
+	response->w[81] = 0x0110;
 
 	/* w82  bit14=nop, bit13=rd, bit12=wr, bit0=smart */
-	response.w[82] = 0x0001; // 0x7001;
+	response->w[82] = 0x0001; // 0x7001;
 
 	/* w83 bit14 must be 1. */
-	response.w[83] = 0x4000;
+	response->w[83] = 0x4000;
 
 	/* Word 84:
 	 *  b15=0
@@ -532,61 +481,49 @@ static int td_dev_ata_ident(struct td_dev_ata_state *state)
 	 *  b1=smart self-test
 	 *  b0=smart logs
 	 */
-	response.w[84] = BIT(14) | BIT(8) | BIT(5) |BIT(2) | BIT(0);
+	response->w[84] = BIT(14) | BIT(8) | BIT(5) |BIT(2) | BIT(0);
 
 	/* w85 copy of 82, make sure bit 15 isn't set.*/
-	response.w[85] = response.w[82];
+	response->w[85] = response->w[82];
 	/* w86 */
-	response.w[86] = response.w[83];
+	response->w[86] = response->w[83];
 	/* w87 */
-	response.w[87] = response.w[84];
+	response->w[87] = response->w[84];
 
 	/* udma0-6 support enabled for SATA */
-	response.w[88] = 0x007F;
+	response->w[88] = 0x007F;
 
-	response.chksum = td_ata16_chksum(&response);
+	response->chksum = td_ata16_chksum(response);
 
-	state->data_from_device = 512;
-	state->data_to_device = 0;
+	cmd->status = SAM_STAT_CHECK_CONDITION;
 
-	/*Now pretend to finish the ATA PT*/
-	state->hdr->status = 0x02;
-	state->hdr->masked_status = CHECK_CONDITION;
-
-	state->hdr->info = 0;
-	state->hdr->host_status = 0;
-	state->hdr->driver_status = 0x08;
-
-	state->hdr->sb_len_wr = sizeof(pt_status);
-
-	memset(&pt_status, 0, sizeof(pt_status));
-	pt_status.hdr[0] = 0x72;
-	pt_status.hdr[7] = 0x0E;
+	pt_status->hdr[0] = 0x72;
+	pt_status->hdr[7] = 0x0E;
 
 	/* These are ATA specified */
-	pt_status.ata.desc = 0x09;
-	pt_status.ata.len = 0x0C;
+	pt_status->ata.desc = 0x09;
+	pt_status->ata.len = 0x0C;
 
+	cmd->resid = cmd->dxfer_len - sizeof(*response);
+	cmd->sense_len = sizeof(*pt_status);
 
-	rc = copy_to_user(state->hdr->dxferp, &response, sizeof(response));
-	if (rc == 0)
-		rc = copy_to_user(state->hdr->sbp, &pt_status, sizeof(pt_status));
-
-	if (rc)
-		rc = -ENOMEM;
+	rc = DRIVER_SENSE;
 
 ucmd_fail:
 	td_ucmd_put(ucmd);
 nomem_fail:
 	return rc;
+denied:
+	return -EIO;
 }
 
-static int td_smart_log_err_sum(struct td_dev_ata_state *state)
+static int td_smart_log_err_sum(struct td_scsi_cmd *cmd,
+		int data_from_device, int data_to_device)
 {
 
 	int rc = -ENOMEM;
 	struct td_ucmd *ucmd[2];
-	struct td_smart_log_err_sum *ret_sum = state->hdr->dxferp;
+	struct td_smart_log_err_sum *ret_sum = NULL;
 	struct td_smart_log_err_sum *sum[2];
 	struct td_smart_err_log_data *log[2];
 	uint16_t ts[2];
@@ -595,7 +532,9 @@ static int td_smart_log_err_sum(struct td_dev_ata_state *state)
 	uint64_t start, end;
 	start = td_get_cycles();
 
-	rc = td_dev_ata_send_cmds(state, ucmd);
+	ret_sum = cmd->dxferp;
+	
+	rc = td_dev_ata_send_cmds(cmd, ucmd, data_from_device, data_to_device);
 	if (unlikely(-ENOMSG == rc))
 		goto nomem;
 
@@ -677,45 +616,42 @@ nomem:
 
 }
 
-static int td_smart_log_comp_err(struct td_dev_ata_state *state){
+static int td_smart_log_comp_err(struct td_scsi_cmd *cmd,
+		int data_from_device, int data_to_device){
 	int rc;
-	//struct td_smart_log_comp_err *cerr = state->hdr->dxferp;
-	//cerr->ver = 0x01;
-	//cerr->chksum = td_ata16_chksum((char*)cerr);
-	//rc = td_dev_ata16_ok(state->hdr);
-	rc = td_dev_ata16_generic(state);
+	rc = td_dev_ata16_generic(cmd, data_from_device, data_to_device);
 	if (rc)
 		goto notok;
 notok:
 	return rc;
 }
 
-static int td_smart_log_stat(struct td_dev_ata_state *state)
+static int td_smart_log_stat(struct td_scsi_cmd *cmd, int data_from_device, int data_to_device)
 {
 	int rc;
 	/* do stuff.. */
-	//rc = td_dev_ata16_ok(state->hdr);
-	rc = td_dev_ata16_generic(state);
+	rc = td_dev_ata16_generic(cmd, data_from_device, data_to_device);
 	if (rc)
 		goto notok;
 notok:
 	return rc;
 }
 
-static int td_smart_rd_log(struct td_dev_ata_state *state)
+static int td_smart_rd_log(struct td_scsi_cmd *cmd, uint8_t log_addr,
+		int data_from_device, int data_to_device)
 {
 
 	int rc = -EINVAL;
 
-	switch (state->log_addr) {
+	switch (log_addr) {
 	case TD_SMART_LOG_ERR:
-		rc = td_smart_log_err_sum(state);
+		rc = td_smart_log_err_sum(cmd, data_from_device, data_to_device);
 		break;
 	case TD_SMART_LOG_CERR:
-		rc = td_smart_log_comp_err(state);
+		rc = td_smart_log_comp_err(cmd, data_from_device, data_to_device);
 		break;
 	case TD_SMART_LOG_STATS:
-		rc = td_smart_log_stat(state);
+		rc = td_smart_log_stat(cmd, data_from_device, data_to_device);
 		break;
 	case TD_SMART_LOG_DIR:
 	case TD_SMART_LOG_ECERR:
@@ -730,8 +666,8 @@ static int td_smart_rd_log(struct td_dev_ata_state *state)
 	case TD_SMART_LOG_RD_STR_ERR:
 	default:
 		printk("smart log addr = %X and will be wrong..\n",
-				state->log_addr);
-		rc = td_dev_ata16_generic(state);
+				log_addr);
+		rc = td_dev_ata16_generic(cmd, data_from_device, data_to_device);
 		break;
 	}
 
@@ -893,13 +829,13 @@ static int td_smart_set_val(struct td_smart_attribute *a1, struct
 	return rc;
 }
 
-static int td_smart_rd_val(struct td_dev_ata_state *state)
+static int td_smart_rd_val(struct td_scsi_cmd *cmd, int data_from_device, int data_to_device)
 {
-	int rc, i;
+	int rc = -EINVAL, i;
 	struct td_ucmd *ucmd[2];
 	struct td_smart_resp *uresp[2];
 	struct td_smart_attribute *uattr[2];
-	struct td_smart_resp *resp = state->hdr->dxferp;
+	struct td_smart_resp *resp = cmd->dxferp;
 	struct td_smart_attribute attr;
 	uint8_t chksum;
 
@@ -907,7 +843,7 @@ static int td_smart_rd_val(struct td_dev_ata_state *state)
 	start = td_get_cycles();
 
 	pr_err("td: td_smart_rd_val\n");
-	rc = td_dev_ata_send_cmds(state, ucmd);
+	rc = td_dev_ata_send_cmds(cmd, ucmd, data_from_device, data_to_device);
 	if (unlikely(-ENOMSG == rc))
 		goto nomem;
 
@@ -950,59 +886,61 @@ nomem:
 	return rc;
 }
 
-static int td_dev_ata16_smart(struct td_dev_ata_state *state)
+int td_dev_ata16_smart(struct td_scsi_cmd *cmd)
 {
 	int ret = -EINVAL;
-	struct pt_16 *cmd = &state->ata_pt_cmd->p16;
+	int data_to_device;
+	int data_from_device;
+	uint8_t log_addr;
+	struct td_ata_pt_cmd *ata_pt_cmd = (struct td_ata_pt_cmd *)cmd->request;
+	struct pt_16 *pt_cmd = &ata_pt_cmd->p16;
 
-	uint16_t features = cmd->feature[0] << 8 | cmd->feature[1];
-	uint16_t valid = cmd->lba_high[1] << 8 | cmd->lba_mid[1];
+	uint16_t features = pt_cmd->feature[0] << 8 | pt_cmd->feature[1];
+	uint16_t valid = pt_cmd->lba_high[1] << 8 | pt_cmd->lba_mid[1];
 
 	if (SMART_VALID != valid) {
 		printk("invalid command due to valid = %04X\n", valid);
 		goto cmd_invalid;
 	}
 
-	state->pg_cnt = cmd->sector_cnt[0] << 8 | cmd->sector_cnt[1];
-	state->log_addr = cmd->lba_low[1];
+	log_addr = pt_cmd->lba_low[1];
 
 	/* All smart commands are 512. */
-	switch((state->ata_pt_cmd->ata_cmd[1] & 0x1E) >> 1) {
+	switch((ata_pt_cmd->ata_cmd[1] & 0x1E) >> 1) {
 
 	case 4: /*PIO IN */
 	case 10:
-		state->data_from_device = 512;
-		state->data_to_device = 0;
+		data_from_device = 512;
+		data_to_device = 0;
 		break;
 
 	case 5: /*PIO OUT */
 	case 11:
-		state->data_from_device = 0;
-		state->data_to_device = 512;
+		data_from_device = 0;
+		data_to_device = 512;
 		break;
 
 	case 3:
 	default:
-		state->data_from_device = 0;
-		state->data_to_device = 0;
+		data_from_device = 0;
+		data_to_device = 0;
 		break;
 	}
 
 	switch(features) {
 	case 0xD5: /* SMART read log */
-		ret = td_smart_rd_log(state);
+		ret = td_smart_rd_log(cmd, log_addr, data_from_device, data_to_device);
 		break;
 	case ATA_SMART_READ_VALUES: /* D0 */
-		ret = td_smart_rd_val(state);
+		ret = td_smart_rd_val(cmd, data_from_device, data_to_device);
 		break;
 	case ATA_SMART_READ_THRESHOLDS: /* D1 */
 	case ATA_SMART_ENABLE:
 	case 0xDA: /* SMART return status */
-		ret = td_dev_ata16_generic(state);
-		//ret = td_dev_ata16_ok(state->hdr);
+		ret = td_dev_ata16_generic(cmd, data_from_device, data_to_device);
 		break;
 	default:
-		ret = td_dev_ata16_generic(state);
+		ret = td_dev_ata16_generic(cmd, data_from_device, data_to_device);
 		printk("SMART cmd not found: %x\n", features);
 		goto cmd_not_found;
 		break;
@@ -1016,26 +954,29 @@ cmd_invalid:
 	return ret;
 }
 
-static int td_dev_ata16_security(struct td_dev_ata_state *state)
+int td_dev_ata16_security(struct td_scsi_cmd *cmd)
 {
 	int rc;
+	int data_from_device;
+	int data_to_device;
 	struct td_ucmd *ucmd[2];
 	uint64_t start, end;
+	struct td_ata_pt_cmd *ata_pt_cmd = (struct td_ata_pt_cmd *)cmd->request;
 	start = td_get_cycles();
 
-	switch (state->ata_pt_cmd->ata_cmd[14]) {
+	switch (ata_pt_cmd->ata_cmd[14]) {
 	case 0xF4:
-		state->data_to_device = 512;
-		state->data_from_device = 0;
+		data_to_device = 512;
+		data_from_device = 0;
 		break;
 	case 0xF3:
 	default:
-		state->data_to_device = 0;
-		state->data_from_device = 0;
+		data_to_device = 0;
+		data_from_device = 0;
 		break;
 	}
 
-	rc = td_dev_ata_send_cmds(state, ucmd);
+	rc = td_dev_ata_send_cmds(cmd, ucmd, data_from_device, data_to_device);
 	if (-ENOMSG == rc)
 		goto nomem;
 
@@ -1056,334 +997,3 @@ nomem:
 
 }
 
-
-static int td_dev_ata12_pass(struct td_dev_ata_state* state)
-{
-	int rc = 0;
-
-	switch(state->cmd) {
-	case ATA_CMD_ID_ATA:
-		rc = td_dev_ata_ident(state);
-		break;
-	default:
-		printk("Error ATA16 pass cmd %02X unknown\n", state->cmd);
-		rc = -EINVAL;
-		break;
-	}
-
-	return rc;
-}
-
-static int td_dev_ata16_pass(struct td_dev_ata_state* state)
-{
-	int rc = 0;
-
-	/* Currently not being used.
-	uint16_t length;
-
-
-	switch (cmd->t_length) {
-	default:
-	case 0x00:
-		length = 0;
-		break;
-	case 0x01:
-		length = cmd->feature[0] << 8 | cmd->feature[1];
-		break;
-	case 0x02:
-		length = cmd->sector_cnt[0] << 8 | cmd->sector_cnt[1];
-		break;
-	case 0x03:
-		pr_err("Error! STPSIU contains the size!?\n");
-		length = 0;
-		break;
-	}
-	*/
-
-	switch(state->cmd) {
-	case ATA_CMD_ID_ATA:
-		rc = td_dev_ata_ident(state);
-		break;
-	case ATA_CMD_SMART:
-		rc = td_dev_ata16_smart(state);
-		break;
-	case ATA_CMD_SEC_ERASE_PREP:
-	case ATA_CMD_SEC_ERASE_UNIT:
-		rc = td_dev_ata16_security(state);
-		break;
-	case 0x2F:
-		printk("Retrieve log treated as generic\n");
-		state->data_from_device = 512;
-		state->data_to_device = 0;
-		rc = td_dev_ata16_generic(state);
-		break;
-	default:
-		printk("Error ATA16 pass cmd %02X unknown\n", state->cmd);
-		rc = -EINVAL;
-		break;
-	}
-
-	return rc;
-}
-#if 0
-static int td_inq_pg00 (struct td_dev_ata_state *state) {
-
-	struct td_ioctl_device_ssd_pt *cmd = state->pt_cmd;
-	td_ata_inq_resp_t *answer = state->answer;
-	uint8_t len = state->hdr->dxfer_len;
-
-	int size;
-	void *loc;
-	struct td_page00 *page00 = &answer->page00;
-	struct td_page00r *page00r = &answer->page00r;
-
-	/* Supported vital product data */
-	/* 0 = perihperal qualifier | peripheral device type */
-	if (cmd->ata_cmd[1] == 0) { /* Return all VPD */
-
-		if (len < 36)
-			goto too_small;
-		page00r->version = 5;
-		page00r->resp_format = 2;
-		page00r->cmd_que = 1;
-		page00r->sync = 1;
-		memcpy(page00r->t10, t10, sizeof(t10) - 1);
-		loc = page00r->pid;
-		memcpy(loc, &model, sizeof(model) - 1);
-		loc = PTR_OFS(loc, sizeof(model) - 1);
-		memcpy(loc, &serial, sizeof(serial) - 1);
-		memcpy(page00r->rev, version, sizeof(version) - 1);
-		if (len >= sizeof(struct td_page00r)) {
-
-			memcpy(page00r->vendor, &vendor, sizeof(vendor) - 1);
-			page00r->size = sizeof(struct td_page00r) - 3;
-			size = page00r->size + 3;
-		}
-		else { /* Smaller request needed. */
-			page00r->size = 33;
-			size = page00r->size + 3;
-		}
-	}
-	else { /* looking for supported pages. */
-		if(len < sizeof(struct td_page00))
-			goto too_small;
-		page00->part[3] = 3; /*We support 3 pages, so 3 more bytes of size.*/
-		page00->part[4] = 0x00; /* List of supported pages */
-		page00->part[5] = 0x80; /* List of supported pages */
-		page00->part[6] = 0x83; /* List of supported pages */
-		size = 7;
-	}
-	return size;
-
-too_small:
-	return 0;
-}
-
-static int td_inq_pg80(struct td_dev_ata_state *state) {
-
-	struct td_ioctl_device_ssd_pt *cmd = state->pt_cmd;
-	td_ata_inq_resp_t *answer = state->answer;
-	uint8_t len = state->hdr->dxfer_len;
-
-	int size = 0;
-	struct td_page80 *page80 = &answer->page80;
-
-	if(len < sizeof(struct td_page80))
-			goto too_small;
-
-	if (cmd->ata_cmd[1] & 1) { /* Unit serial number */
-		page80->page = 0x80;
-		page80->size = sizeof(struct td_page80);
-		memcpy(page80->serial, serial, sizeof(serial));
-		size = page80->size;
-	}
-	else {
-	}
-	return size;
-
-too_small:
-	return 0;
-}
-
-static int td_inq_pg83(struct td_dev_ata_state *state) {
-
-	struct td_ioctl_device_ssd_pt *cmd = state->pt_cmd;
-	td_ata_inq_resp_t *answer = state->answer;
-	uint8_t len = state->hdr->dxfer_len;
-
-	int size = 0;
-	struct td_page83 *page83 = &answer->page83;
-	struct td_page83_desc *desc;
-	if(len < sizeof(struct td_page83))
-			goto too_small;
-
-	if (cmd->ata_cmd[1] & 1) { /* Device Identification */
-		page83->page = 0x83;
-		page83->size = sizeof(struct td_page83) - 3;
-		/* Start of identification descriptor list. */
-		desc = &page83->desc[0];
-		desc->pid = 5;
-		desc->code_set = 2;
-		desc->id_type = 1;
-		desc->size = sizeof(struct td_page83_desc) - 3;
-		memcpy(desc->string, t10, sizeof(t10));
-		
-		desc = &page83->desc[1];
-		desc->pid = 5;
-		desc->code_set = 2;
-		desc->id_type = 0;
-		desc->size = sizeof(struct td_page83_desc) - 3;
-		memcpy(desc->string, serial, sizeof(serial));
-		
-		/* Next identification desc->iptor. */
-		desc = &page83->desc[2];
-		desc->pid = 5;
-		desc->code_set = 2;
-		desc->id_type = 0;
-		desc->size = sizeof(struct td_page83_desc) - 3;
-		memcpy(desc->string, vendor, sizeof(vendor));
-
-		/* Next identification desc->iptor. */
-		desc = &page83->desc[3];
-		desc->pid = 5;
-		desc->code_set = 2;
-		desc->id_type = 8;
-		desc->size = sizeof(struct td_page83_desc) - 3;
-		memcpy(desc->string, model, sizeof(model));
-
-		/* Next identification desc->iptor. */
-		desc = &page83->desc[4];
-		desc->code_set = 2;
-		desc->id_type = 0;
-		desc->size = sizeof(struct td_page83_desc) - 3;
-		memcpy(desc->string, version, sizeof(version));
-
-		size = page83->size + 3;
-	}
-	else {
-	}
-	return size;
-
-too_small:
-	return 0;
-}
-
-static int td_inq_inval( sg_io_hdr_t *hdr) {
-	return -EINVAL;
-}
-#endif
-
-static int td_inquiry( struct td_dev_ata_state* state)
-{
-	struct td_ucmd *ucmd[2];
-	return td_dev_ata_send_cmds(state, ucmd);
-}
-
-
-/* FIXME: Should this just fire off the command and let Smart Storage sort it
- * out?*/
-int td_dev_sgio_v3(struct td_engine *eng, sg_io_hdr_t *hdr)
-{
-	int rc = -ENOTSUPP;
-	struct td_dev_ata_state state;
-
-	memset(&state, 0, sizeof(state));
-	rc = td_cmd_ata_filter(hdr->cmdp);
-	if (rc)
-		goto not_sane;
-
-	if (hdr->flags & SG_FLAG_MMAP_IO)
-	{
-		if (hdr->flags & SG_FLAG_DIRECT_IO) {
-			rc = -EINVAL;
-			goto mmap_direction_inval;
-		}
-	}
-
-	if (!access_ok(VERIFY_READ, hdr->cmdp, hdr->cmd_len)) {
-		rc = -EPERM;
-		goto perm_fail;
-	}
-
-	state.hdr = hdr;
-	state.eng = eng;
-	state.p_resp = PTR_OFS(hdr->sbp, 8);
-	memset(state.resp, 0, sizeof(struct td_ata_pt_resp));
-
-	state.answer = kzalloc(sizeof(td_ata_inq_resp_t), GFP_USER);
-	if (!state.answer) {
-		rc = -ENOMEM;
-		goto no_mem;
-	}
-
-	if ((!hdr->cmdp) || (hdr->cmd_len < 6 ) ||
-			(hdr->cmd_len > sizeof(struct td_ata_pt_cmd))) {
-		rc = -EMSGSIZE;
-		goto msg_inval;
-	}
-
-
-	state.pt_cmd = (struct td_ioctl_device_ssd_pt*)hdr->cmdp;
-	state.ata = state.pt_cmd->ata_cmd;
-	if (ATA_16 == state.ata[0]) {
-		state.cmd = state.ata_pt_cmd->p16.cmd;
-		rc = td_dev_ata16_pass(&state);
-		if (rc)
-			goto ata16_setup_fail;
-
-		hdr->resid = hdr->dxfer_len - state.data_from_device -
-			state.data_to_device;
-	}
-	else if (ATA_12 == state.ata[0]) {
-		state.cmd = state.ata_pt_cmd->p12.cmd;
-		rc = td_dev_ata12_pass(&state);
-		if (rc)
-			goto ata12_setup_fail;
-
-		hdr->resid = hdr->dxfer_len - state.data_from_device -
-			state.data_to_device;
-	}
-	else if ( INQUIRY == state.ata[0] ) {
-		rc = td_inquiry(&state);
-		if (rc)
-			goto inquiry_fail;
-	}
-
-inquiry_fail:
-ata12_setup_fail:
-ata16_setup_fail:
-	kfree(state.answer);
-no_mem:
-msg_inval:
-perm_fail:
-mmap_direction_inval:
-not_sane:
-
-	return rc;
-}
-
-int td_device_block_sgio(struct td_engine *eng, sg_io_hdr_t *hdr)
-{
-	int rc = -EIO;
-
-	if (!td_state_can_accept_requests(eng)) {
-		goto denied;
-	}
-
-	switch (hdr->interface_id) {
-	case 'S': /* V3 */
-		rc = td_dev_sgio_v3(eng, hdr);
-		break;
-	case 'Q': /* V4 not supported yet. */
-		//td_eng_err(eng, "TSA: SG_IO V4 not supported!\n");
-		rc = -EINVAL;
-		break;
-	default:
-		td_eng_err(eng, "TSA: SG_IO %d not supported.\n", hdr->interface_id);
-		rc = -ENOTSUPP;
-		break;
-	}
-
-denied:
-	return rc;
-}

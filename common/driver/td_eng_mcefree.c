@@ -204,7 +204,7 @@ static void mcefree_rdbuf_marker_error_occured(struct td_engine *eng)
 {
 	uint64_t val, max;
 
-	eng->td_counters.misc.rdbuf_marker_error_cnt ++;
+	td_eng_counter_misc_inc(eng, RDBUF_MARKER_ERROR_CNT);
 	eng->td_last_rdbuf_marker_error = td_get_cycles();
 
 	/* current value */
@@ -387,7 +387,7 @@ static int mcefree_decode_rdbuf_marker_to_corebuf(
 
 missmatch:
 	if (complain) {
-		td_eng_err(eng, "RDBUF %u invalid marker found\n",
+		td_eng_warn(eng, "RDBUF %u invalid marker found\n",
 				mck->rdbuf);
 		td_dump_data("    ", metadata, 64);
 	}
@@ -811,7 +811,7 @@ td_eng_trace(eng, TR_RDBUF, "==========================", 0);
 		}
 	}
 
-	update_rdbuf_stats(eng, eng->td_counters.misc.rdbuf_marker_error_cnt,
+	update_rdbuf_stats(eng, td_eng_counter_misc_get(eng, RDBUF_MARKER_ERROR_CNT),
 			td_eng_conf_mcefree_var_get(eng, RDBUF_HOLD_NSEC));
 
 	td_eng_trace(eng, TR_RDBUF, "fwstatus:find:rc    ", rc);
@@ -819,7 +819,7 @@ td_eng_trace(eng, TR_RDBUF, "==========================", 0);
 		eng->td_early_completed_reads_tokens.count);
 
 	if (rc == -ETIMEDOUT) {
-		eng->td_counters.misc.rdbuf_matching_timeout_cnt ++;
+		td_eng_counter_misc_inc(eng, RDBUF_MATCHING_TIMEOUT_CNT);
 		goto rdbuf_timeout;
 	}
 
@@ -885,7 +885,7 @@ rdbuf_timeout:
 	td_eng_trace(eng, TR_RDBUF, "fwstatus:rdbuf:timeout", usec);
 
 	/* count the mismatch */
-	eng->td_counters.misc.rdbuf_progress_timeout_cnt ++;
+	td_eng_counter_misc_inc(eng, RDBUF_PROGRESS_TIMEOUT_CNT);
 
 	td_eng_trace(eng, TR_RDBUF, "fwstatus:forced_claim:rdbuf", mck.rdbuf);
 

@@ -93,6 +93,34 @@ static inline long __must_check IS_ERR_OR_NULL(const void *ptr)
 #ifndef INIT_COMPLETION
 #define INIT_COMPLETION(x) reinit_completion(&x)
 #endif
+
+#ifdef KABI__bio_bi_size
+/* Linux git commit 4f024f37 changed the bio struct*/
+#define bio_size        bi_size
+#define bio_sector      bi_sector
+#define bio_idx         bi_idx
+#define td_bvec_iter    int
+#define td_bv_idx(x)    x
+
+/* Create our own for_each to use bvec and not *bvec. */
+#define td_bio_for_each_segment(bvec, bio, iter)                       \
+	for (iter = (bio)->bi_idx;                                     \
+		bvec = (bio)->bi_io_vec[iter], iter < (bio)->bi_vcnt;  \
+		iter++)
+
+#else
+
+#define bio_size        bi_iter.bi_size
+#define bio_sector      bi_iter.bi_sector
+#define bio_idx         bi_iter.bi_idx
+#define td_bvec_iter    struct bvec_iter
+#define td_bv_idx(x)    x.bi_idx
+
+#define td_bio_for_each_segment(bvec, bio, iter) \
+	bio_for_each_segment(bvec, bio, iter)
+#endif
+
+
 #else
 /***************************************************************************
  *                                                                         *

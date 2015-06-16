@@ -1,9 +1,8 @@
-#define __KERNEL__
-#include <linux/kconfig.h>
+#include <linux/kernel.h>
 #include <asm/atomic.h>
 #include <linux/types.h>
 
-uint64_t foo() {
+uint64_t foo(void) {
 	atomic64_t bar;
 	atomic64_set(&bar, 2ULL);
 	atomic64_xchg(&bar, 1ULL);

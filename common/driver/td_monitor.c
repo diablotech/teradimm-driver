@@ -75,9 +75,8 @@ static void td_monitor_start_read(struct td_ucmd *ucmd, struct td_engine *eng)
 {
 	// like td_ucmd_run but without the wait
 	td_ucmd_ready(ucmd);
-	td_ucmd_get(ucmd);
 	td_enqueue_ucmd(eng, ucmd);
-	td_engine_poke(eng);
+	td_engine_sometimes_poke(eng);
 }
 
 static int td_monitor_read_ecc_counts(struct td_engine *eng)
@@ -180,7 +179,17 @@ static int td_monitor_read_ecc_alarm(struct td_engine *eng)
 
 	param = ucmd->data_virt;
 
+	if (param->magic_1.u32 != TD_PARAM_PAGE_1_MAGIC_1 ||
+			param->magic_2.u32 != TD_PARAM_PAGE_1_MAGIC_2) {
+		td_eng_err(eng, "get_params page 1 has unexpected magic values(%u %u)\n",
+				param->magic_1.u32, param->magic_2.u32);
+		rc = -EINVAL;
+		goto error;
+	}
+
 	eng->ecc_bins.ecc_alarm = param->ecc_alarm.value;
+
+	rc = 0;
 
 error:
 	if (ucmd)
@@ -240,7 +249,8 @@ static void td_monitor_restore_ecc_alarm_state(struct td_engine *eng)
 		return;
 
 	// read ecc_alarm from params page 1
-	td_monitor_read_ecc_alarm(eng);
+	if (td_monitor_read_ecc_alarm(eng))
+		return;
 
 	if (eng->ecc_bins.ecc_alarm & ECC_ALARM_INTERNAL_INVALID) {
 		// set ecc_alarm for the first time

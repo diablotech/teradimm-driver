@@ -72,6 +72,7 @@ struct td_discovered_info
 	/* Memory information */
 	uint64_t        mem_base;
 	uint64_t        mem_size;
+	uint64_t        mem_avoid_mask;
 	unsigned int    mem_speed;
 	
 	/* Description of memory controller/package */
@@ -136,6 +137,7 @@ struct td_device_info {
 	char dev_name[6];
 	uint64_t offset;
 	uint64_t size;
+	uint64_t avoid_mask;
 	uint32_t irq;
 	td_uid_t uid;
 	int use_cpu;

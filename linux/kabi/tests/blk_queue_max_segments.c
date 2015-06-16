@@ -1,4 +1,3 @@
-#define __KERNEL__
 #include <linux/kernel.h>
 #include <linux/blkdev.h>
 

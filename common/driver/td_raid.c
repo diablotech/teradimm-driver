@@ -65,9 +65,9 @@
 #include "td_ucmd.h"
 #include "td_eng_hal.h"
 #include "td_discovery.h"
-#include "td_dev_ata.h"
+#include "td_sgio.h"
 #include "td_memspace.h"
-#include "td_biogrp.h"
+#include "td_bio.h"
 
 #include "td_raidmeta.h"
 
@@ -91,16 +91,36 @@ static inline void td_raid_format_uuid(uint8_t *uuid, char *buffer)
 			uuid[15]);
 }
 
+static inline const char* tr_member_state_name(enum td_raid_member_state s)
+{
+	switch (s) {
+	case TR_MEMBER_EMPTY:
+		return "EMPTY";
+	case TR_MEMBER_ACTIVE:
+		return "ACTIVE";
+	case TR_MEMBER_FAILED:
+		return "FAILED";
+	case TR_MEMBER_SYNC:
+		return "SYNC";
+	case TR_MEMBER_SPARE:
+	case TD_RAID_MEMBER_STATE_MAX:
+		/* fall out */;
+	}
+	return "<UNKNOWN>";
+}
 
 /* Forward declartions - we give these functions to the osdev API */
 void td_raid_destroy (struct td_osdev *odev);
 int td_raid_ioctl(struct td_osdev* rdev, unsigned int cmd, unsigned long raw_arg);
 
 /* Other forward declarations */
-static void td_raid_save_meta (struct td_raid *rdev);
-static void td_raid_update_member(struct td_raid *rdev, int member_idx,
-		struct td_device *dev);
+static void td_raid_init_member(struct td_raid *rdev, int member_idx,
+		struct td_device *dev, enum td_raid_member_state state);
 
+static void td_raid_apply_metadata (struct td_raid *rdev,
+		struct tr_meta_data_struct *md, int redo);
+
+static void td_raid_resync_wait(struct td_raid *dev);
 
 #define STATIC_ASSERT(expr)                                             \
 	switch (0) {                                                    \
@@ -133,6 +153,7 @@ static void __td_raid_fill_meta (struct td_raid *rdev, struct tr_meta_data_struc
 
 
 	md->signature.version = TR_METADATA_VERSION;
+	md->signature.generation = rdev->tr_generation;
 	
 	for (i = 0; i < TR_CONF_GENERAL_MAX; i++) {
 		struct td_ioctl_conf_entry *c = md->raid_info.conf + i;
@@ -154,7 +175,7 @@ static void __td_raid_fill_meta (struct td_raid *rdev, struct tr_meta_data_struc
 
 	for (i = 0; i < TR_META_DATA_MEMBERS_MAX; i++) {
 		struct tr_member *trm;
-		if (! (rdev->tr_member_mask & 1UL<<i))
+		if (! TR_MEMBERSET_TEST(rdev, i) )
 			continue;
 
 		trm = rdev->tr_members + i;
@@ -162,57 +183,83 @@ static void __td_raid_fill_meta (struct td_raid *rdev, struct tr_meta_data_struc
 
 		memcpy(md->member[i].uuid, trm->trm_device->os.uuid, TD_UUID_LENGTH);
 		md->member[i].state = trm->trm_state;
-		md->member[i].generation = 1;
 	}
 
 }
 
-static void td_raid_save_meta (struct td_raid *rdev)
+void td_raid_save_meta (struct td_raid *rdev, int wait)
 {
 	struct tr_meta_data_struct *md;
+	struct td_ucmd **member_ucmds;
+
 	int i;
 
 	/* We must be locked, so only one at a time */
 	WARN_TD_DEVICE_UNLOCKED(rdev);
 
-td_raid_warn(rdev, "***** Saving metadata *****\n");
-	md = kmap(rdev->tr_meta_page);
+	member_ucmds = kmalloc(sizeof(struct td_ucmd)*tr_conf_var_get(rdev, MEMBERS), GFP_KERNEL);
 
+td_raid_warn(rdev, "***** Saving metadata generation %llu *****\n",
+		rdev->tr_generation);
+
+	md = kmalloc(TD_PAGE_SIZE, GFP_KERNEL);
 	__td_raid_fill_meta(rdev, md);
+
 	td_dump_data("RAID: ", md, sizeof(*md));
 
 	for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
+		struct td_ucmd *ucmd;
 		struct tr_member *trm;
 		struct td_engine *eng;
-		if (! (rdev->tr_member_mask & 1UL<<i))
+
+		if (! TR_MEMBERSET_TEST(rdev, i) ) {
+			member_ucmds[i] = NULL;
 			continue;
+		}
 
 		trm = rdev->tr_members + i;
 		BUG_ON(trm->trm_device == NULL);
 
+		if (trm->trm_state == TR_MEMBER_FAILED) {
+			td_raid_warn(rdev, "Skipping metadata on failed device %d: %s\n",
+					i, td_device_name(trm->trm_device));
+			member_ucmds[i] = NULL;
+			continue;
+		}
 		eng = td_device_engine(trm->trm_device);
 
-		td_eng_cmdgen(eng, set_params, trm->ucmd->ioctl.cmd, 13);
+		ucmd = member_ucmds[i] = td_ucmd_alloc(TD_PAGE_SIZE);
+		ucmd->ioctl.data_len_to_device = TD_PAGE_SIZE;
+		memcpy(ucmd->data_virt, md, TD_PAGE_SIZE);
+
+		td_eng_cmdgen(eng, set_params, ucmd->ioctl.cmd, 13);
 
 		/* The UCMD boiler code, minus the wait */
-		td_ucmd_ready(trm->ucmd);
-		td_ucmd_get(trm->ucmd);
-		td_enqueue_ucmd(eng, trm->ucmd);
-		td_engine_poke(eng);
+		td_ucmd_ready(ucmd);
+		td_enqueue_ucmd(eng, ucmd);
+		td_engine_sometimes_poke(eng);
 	}
 
 	for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
-		struct tr_member *trm;
-		if (! (rdev->tr_member_mask & 1UL<<i))
+		struct td_ucmd *ucmd = member_ucmds[i];
+
+		if (ucmd == NULL)
 			continue;
 
-		trm = rdev->tr_members + i;
-
 		/* Now we wait */
-		td_ucmd_wait(trm->ucmd);
+		if (wait)
+			td_ucmd_wait(ucmd);
+		else {
+			struct tr_member *trm = rdev->tr_members + i;
+			td_raid_info(rdev, "Throwing update at %d: %s\n",
+					i, td_device_name(trm->trm_device));
+		}
+
+		td_ucmd_put(ucmd);
 	}
 
-	kunmap((void*)md);
+	kfree(member_ucmds);
+	kfree(md);
 }
 
 
@@ -251,75 +298,117 @@ void td_raid_exit(void)
  */
 int td_raid_delete(const char* name)
 {
-	int rc;
-	struct td_raid *dev;
+	int rc, i;
+	struct td_raid *rdev;
 	mutex_lock(&td_raid_list_mutex);
 
 	rc = -ENOENT;
-	dev = td_raid_get(name);
-	if (!dev) {
-		pr_err("ERROR: Could not find device '%s'.\n", name);
+	rdev = td_raid_get(name);
+	if (!rdev) {
+		pr_err("ERROR: Could not find raid '%s'.\n", name);
 		goto bail_no_ref;
 	}
-	td_raid_lock(dev);
+	td_raid_lock(rdev);
 
+#if 0
 	/*
 	 * Check if all members are remvoed */
 	rc = -EBUSY;
-	if (dev->tr_member_mask) {
-		td_raid_err(dev, "Cannod delete: Active members\n");
+	if (! TR_MEMBERSET_EMPTY(rdev) ) {
+		td_raid_err(rdev, "Cannot delete: Active members\n");
 		goto bail_active_members;
 	}
+#endif
 
 	/* check if the raid is bing used (mounted/open/etc) */
 	rc = -EBUSY;
-	if (atomic_read(&dev->os.control_users)
-			|| atomic_read(&dev->os.block_users)) {
+	if (atomic_read(&rdev->os.control_users)
+			|| atomic_read(&rdev->os.block_users)) {
 		goto bail_in_use;
 	}
-	NO_RD_DEBUG(dev, "unregister\n");
+	NO_RD_DEBUG(rdev, "unregister\n");
 
-	switch (td_raid_state(dev)) {
-	case TD_RAID_STATE_DEGRADED:
-	case TD_RAID_STATE_FAILED:
-	case TD_RAID_STATE_RESYNC:
-		td_raid_warn(dev, "Raid destroyed in inconsistent state");
-		/* Fall through */
-	case TD_RAID_STATE_OPTIMAL:
-		td_osdev_offline(&dev->os);
+	switch (rdev->tr_dev_state) {
+	case TD_RAID_STATE_ONLINE:
+		goto bail_in_use;
+		break;
 
-	default:
+	default: /* Other dev states don't require action */
 		/* break */;
-
 	}
 
-	td_osdev_unregister(&dev->os);
+	td_raid_info(rdev, "Deleting raid\n");
+	td_osdev_unregister(&rdev->os);
+	
+	/*
+	 * First we need to make sure resync will stop
+	 * We set all devices to FAILED.  When the resync sees this, it will
+	 * fail the sync target (no-op, failed)
+	 * We explicity try and avoid meta-data updates here
+	 */
+	for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
+		struct tr_member *trm = rdev->tr_members + i;
+		trm->trm_state = TR_MEMBER_FAILED;
+	}
+	td_raid_resync_wait(rdev);
+
+	/* And now we forcibly remove all members */
+	for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
+		if (TR_MEMBERSET_TEST(rdev, i) ) {
+			struct tr_member *trm = rdev->tr_members + i;
+			struct td_device *dev = trm->trm_device;
+			/*
+			 * We do the basics of detach, with no metadata or
+			 * notification
+			 */
+			td_device_lock(dev);
+			td_raid_info(rdev, "Removing member %d: %s\n", 
+					i, td_device_name(dev));
+
+			/* This device is now just OFFLINE */
+			td_device_enter_state(dev, OFFLINE);
+			dev->td_raid =  NULL;
+
+			/* And now we unlock */
+			td_device_unlock(dev);
+
+			/* we need to release the main raid reference */
+			td_device_put(dev);
+
+			trm->trm_device = NULL;
+			if (trm->trm_ucmd) {
+				td_ucmd_put(trm->trm_ucmd);
+				trm->trm_ucmd = NULL;
+			}
+		}
+	}
+
+
 	td_raid_list_count --;
 
-	if (dev->ops) {
-		rc = dev->ops->_destroy(dev);
+	if (rdev->ops) {
+		rc = rdev->ops->_destroy(rdev);
 		if (rc)
-			td_raid_warn(dev, "Raid ops cleanup rc = %d\n", rc);
+			td_raid_warn(rdev, "Raid ops cleanup rc = %d\n", rc);
 	}
 
-	NO_RD_DEBUG(dev, "done\n");
+	NO_RD_DEBUG(rdev, "done\n");
 	rc = 0;
 
 bail_in_use:
-bail_active_members:
-	NO_RD_DEBUG(dev, "unlock\n");
-	td_raid_unlock(dev);
+	NO_RD_DEBUG(rdev, "unlock\n");
+	td_raid_unlock(rdev);
 	/* return the reference obtained above with _get() */
-	td_raid_put(dev);
+	td_raid_put(rdev);
 
 bail_no_ref:
 
 	mutex_unlock(&td_raid_list_mutex);
 
 	if(!rc) {
-		NO_RD_DEBUG(dev, "put\n");
+		NO_RD_DEBUG(rdev, "put\n");
 		/* return the reference held by the OS */
-		td_raid_put(dev);
+		td_raid_put(rdev);
 		/* return the module reference held by this device.*/
 		module_put(THIS_MODULE);
 	}
@@ -357,33 +446,6 @@ static int __iter_raid_check_exists(struct td_osdev *dev, void* data)
 	return 0;
 }
 
-
-#ifdef CONFIG_TERADIMM_DEPREICATED_RAID_CREATE_V0
-/** 
- * \brief create a raid device
- * 
- * @param name    - name of device to create
- * @param uuid    - UUID of device
- * @param level   - Raid level of device, for config
- * @param member_count  - Number of members the raid should expect
- * @return 0 if success, -ERROR
- *
- */
-int td_raid_create_v0 (const char *name, const uint8_t uuid[TR_UUID_LENGTH],
-		enum td_raid_level level, int members_count)
-{
-	struct td_ioctl_conf_entry conf[3];
-	conf[0].type = TD_RAID_CONF_GENERAL;
-	conf[0].var = TR_CONF_GENERAL_LEVEL;
-	conf[0].val = level;
-	conf[1].type = TD_RAID_CONF_GENERAL;
-	conf[1].var = TR_CONF_GENERAL_MEMBERS;
-	conf[1].val = members_count;
-
-	return td_raid_create(name, uuid, 2, conf);
-}
-#endif
-
 int td_raid_create (const char *name, const uint8_t uuid[TR_UUID_LENGTH],
 		int conf_count, struct td_ioctl_conf_entry* conf)
 {
@@ -408,7 +470,7 @@ int td_raid_create (const char *name, const uint8_t uuid[TR_UUID_LENGTH],
 			goto error_create;
 	}
 
-	printk("CREATING RAID DEVCE \"%s\"\n", name);
+	printk("CREATING RAID DEVICE \"%s\"\n", name);
 
 	rc = -ENOMEM;
 	dev = kzalloc(sizeof(struct td_raid), GFP_KERNEL);
@@ -447,7 +509,7 @@ int td_raid_create (const char *name, const uint8_t uuid[TR_UUID_LENGTH],
 
 	rc = dev->ops->_init(dev);
 	if (rc) {
-		td_raid_err(dev, "Failed to init raid level %d\n", raid_level);
+		td_raid_err(dev, "Failed to initialize raid level %d\n", raid_level);
 		goto error_ops;
 	}
 
@@ -461,14 +523,15 @@ int td_raid_create (const char *name, const uint8_t uuid[TR_UUID_LENGTH],
 		}
 	}
 
+	/* Now go about making things, we are failed when we start */
+	tr_enter_run_state(dev, FAILED);
+
+	/* Add our members */
 	rc = sizeof(struct tr_member) * tr_conf_var_get(dev, MEMBERS);
 	dev->tr_members = kzalloc(rc, GFP_KERNEL);
 	rc = -ENOMEM;
 	if (!dev->tr_members)
 		goto error_members;
-
-	dev->tr_meta_page = alloc_page(GFP_KERNEL);
-	
 
 	rc = td_osdev_init(&dev->os, TD_OSDEV_RAID, name, td_raid_ioctl, td_raid_destroy);
 	if (rc) {
@@ -495,17 +558,14 @@ int td_raid_create (const char *name, const uint8_t uuid[TR_UUID_LENGTH],
 	}
 
 
-	init_completion(&dev->tr_state_change_completion);
-
 	rc = td_osdev_register(&dev->os);
 	if (rc) {
 		td_raid_err(dev, "Failed to register OS device, err=%d.\n", rc);
 		goto error_os_register;
 	}
 
-	td_raid_enter_state(dev, CREATED);
-
-	pr_err("%s:%d: rdev %p in state %d\n", __func__, __LINE__, dev, dev->tr_state);
+	tr_enter_dev_state(dev, CREATED);
+	dev->tr_generation = 1;
 
 	td_raid_list_count ++;
 	mutex_unlock(&td_raid_list_mutex);
@@ -525,9 +585,6 @@ error_members:
 	if (dev->ops)
 		dev->ops->_destroy(dev);
 
-	if (dev->tr_meta_page)
-		__free_page(dev->tr_meta_page);
-
 	dev->ops = NULL;
 
 	if (dev->tr_members)
@@ -539,22 +596,6 @@ error_create:
 	return rc;
 }
 
-
-#if 0
-int td_raid_create_new (const char *name, const uint8_t uuid[TR_UUID_LENGTH],
-		enum td_raid_level level, int members_count)
-{
-
-	uint32_t size = TD_IOCTL_DEVICE_CONF_SIZE(1);
-	struct td_ioctl_device_conf *conf = kmalloc(size, GFP_KERNEL);
-
-	strncpy(create.raid_name, td->raid_name, sizeof(create.raid_name));
-	memcpy(create->raid_name, name, sizeof(create->raid_name)
-	create.raid_members_count = td->val2;
-
-	kfree(create);
-}
-#endif
 
 int td_raid_discover_device(struct td_device *dev, void *meta_data)
 {
@@ -594,7 +635,8 @@ int td_raid_discover_device(struct td_device *dev, void *meta_data)
 	mutex_lock(&tr_discovery_mutex);
 
 	td_raid_format_uuid(md->signature.uuid, buffer);
-	td_dev_info(dev, "RAID Signature: %s\n", buffer);
+	td_dev_info(dev, "RAID Signature: %s [%llu]\n", buffer,
+						md->signature.generation);
 
 	rdev = td_raid_get_uuid(md->signature.uuid);
 	if (rdev == NULL) {
@@ -620,10 +662,8 @@ int td_raid_discover_device(struct td_device *dev, void *meta_data)
 		rdev = td_raid_get_uuid(md->signature.uuid);
 		BUG_ON(rdev == NULL);
 
-		for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
-			trm = rdev->tr_members + i;
-			memcpy(trm->trm_uuid, md->member[i].uuid, TD_UUID_LENGTH);
-		}
+		td_raid_apply_metadata(rdev, md, 0);
+
 	}
 
 	td_raid_lock(rdev);
@@ -653,21 +693,45 @@ int td_raid_discover_device(struct td_device *dev, void *meta_data)
 	}
 
 	if (rdev->ops->_check_member) {
-		if (rdev->ops->_check_member(rdev, dev, rdev->tr_member_mask == 0) ) {
+		if (rdev->ops->_check_member(rdev, dev) ) {
 			td_raid_err(rdev, "Device '%s' not compatible for raid\n", td_device_name(dev));
 			goto error_no_dev;
 		}
 	}
 
-	td_raid_update_member(rdev, i, dev);
+	if (md->signature.generation+1 == rdev->tr_generation) {
+		td_raid_init_member(rdev, i, dev, md->member[i].state);
+	} else if (md->signature.generation+1 > rdev->tr_generation) {
+
+		td_raid_info(rdev, "Metadata newer than raid, applying\n");
+		td_raid_apply_metadata(rdev, md, 1);
+		td_raid_init_member(rdev, i, dev, md->member[i].state);
+	} else {
+		td_raid_warn(rdev, "Old metadata on %d: %s, FAILED\n",
+				i, td_device_name(dev));
+		td_raid_init_member(rdev, i, dev, TR_MEMBER_FAILED);
+	}
+
+
+	if (rdev->ops->_handle_member) {
+		if (rdev->ops->_handle_member(rdev, i) ) {
+			td_raid_err(rdev, "Error handling '%s'\n",
+					td_device_name(dev));
+			return -EIO;
+		}
+	}
+
 	/* Now see if it's complete */
-	if (rdev->tr_member_mask == (1UL << tr_conf_var_get(rdev, MEMBERS)) - 1) {
-		td_raid_info(rdev, "Discovery complete, going online\n");
+	if (TR_MEMBERSET_FULL(rdev) ) {
+		td_raid_info(rdev, "Discovery complete, attempting to go online\n");
 		td_raid_go_online(rdev);
 	}
 
 error_no_dev:
 	td_raid_unlock(rdev);
+
+	/* Return our reference */
+	td_raid_put(rdev);
 
 error_no_rdev:
 	mutex_unlock(&tr_discovery_mutex);
@@ -686,24 +750,28 @@ int td_raid_go_online(struct td_raid *dev)
 	WARN_TD_DEVICE_UNLOCKED(dev);
 
 	/*  already in this state */
-	if (!td_raid_check_state(dev, OFFLINE)
-			&& !td_raid_check_state(dev, CREATED)) {
+	if (!tr_check_dev_state(dev, OFFLINE)
+			&& !tr_check_dev_state(dev, CREATED)) {
 		td_raid_err(dev, "Cannot go online, not offline\n");
 		return -EBUSY;
 	}
-	
-	if (dev->tr_member_mask != (1UL << tr_conf_var_get(dev, MEMBERS)) - 1) {
-		td_raid_err(dev, "Cannot go online, members missing\n");
-		return -EINVAL;
+
+	if (! dev->ops->_online) {
+		td_raid_err(dev, "No online support\n");
+		return -ENOENT;
+	}
+
+	rc = dev->ops->_online(dev);
+	if (rc) {
+		td_raid_err(dev, "Unable to go online\n");
+		goto error_failed_online;
 	}
 	
-	if (dev->ops->_online) {
-		rc = dev->ops->_online(dev);
-		if (rc) {
-			td_raid_err(dev, "Unable to go online\n");
-			goto error_failed_online;
-		}
-	}
+	dev->os.block_params.capacity = tr_conf_var_get(dev, CAPACITY);
+	dev->os.block_params.bio_max_bytes = tr_conf_var_get(dev, BIO_MAX_BYTES);
+	dev->os.block_params.bio_sector_size = tr_conf_var_get(dev, BIO_SECTOR_SIZE);
+	dev->os.block_params.hw_sector_size = tr_conf_var_get(dev, HW_SECTOR_SIZE);
+	dev->os.block_params.discard = 0;
 
 	rc = td_osdev_online(&dev->os);
 	if (rc) {
@@ -711,28 +779,30 @@ int td_raid_go_online(struct td_raid *dev)
 		goto error_failed_online;
 	}
 
-	/* Since for now we only handle optimal */
-	td_raid_enter_state(dev, OPTIMAL);
+	tr_enter_dev_state(dev, ONLINE);
 
-	td_raid_save_meta(dev);
+	td_raid_save_meta(dev, 1);
 	return 0;
 
 error_failed_online:
-	td_raid_enter_state(dev, OFFLINE);
+	tr_enter_dev_state(dev, OFFLINE);
 	return rc;
 }
 
 int td_raid_go_offline(struct td_raid *dev)
 {
 	WARN_TD_DEVICE_UNLOCKED(dev);
+	
+	/*  already in this state */
+	if (!tr_check_dev_state(dev, ONLINE))
+		return -EEXIST;
 
-	switch (td_raid_state(dev)) {
-	case TD_RAID_STATE_DEGRADED:
-	case TD_RAID_STATE_FAILED:
-	case TD_RAID_STATE_RESYNC:
+	switch (dev->tr_run_state) {
+	case TR_RUN_STATE_DEGRADED:
+	case TR_RUN_STATE_FAILED:
 		td_raid_warn(dev, "Raid going offline in inconsistent state");
 		/* Fall through */
-	case TD_RAID_STATE_OPTIMAL:
+	case TR_RUN_STATE_OPTIMAL:
 		break;
 		
 	default:
@@ -745,9 +815,10 @@ int td_raid_go_offline(struct td_raid *dev)
 
 	// TODO: set members offline
 
-	td_osdev_offline(&dev->os);
+	if (td_osdev_offline(&dev->os))
+		return -EBUSY;
 
-	td_raid_enter_state(dev, OFFLINE);
+	tr_enter_dev_state(dev, OFFLINE);
 
 	return 0;
 }
@@ -793,90 +864,250 @@ void td_raid_put(struct td_raid *dev)
 	td_osdev_put(&dev->os);
 }
 
-static void td_raid_update_member(struct td_raid *rdev, int member_idx,
-		struct td_device *dev)
+int __td_raid_change_member(struct td_raid *rdev, int idx,
+		enum td_raid_member_state state, int lock)
+{
+	struct tr_member *trm = rdev->tr_members + idx;
+	
+	if (trm->trm_state == state)
+		return 0;
+
+	trm->trm_state = state;
+	switch (trm->trm_state) {
+	case TR_MEMBER_EMPTY:
+		TR_MEMBERSET_CLEAR(rdev, idx);
+		TR_ACTIVESET_CLEAR(rdev, idx);
+		memset(trm->trm_uuid, 0, sizeof(trm->trm_uuid));
+		break;
+
+	case TR_MEMBER_FAILED:
+	case TR_MEMBER_SYNC:
+		TR_ACTIVESET_CLEAR(rdev, idx);
+		TR_MEMBERSET_SET(rdev, idx);
+		break;
+
+	case TR_MEMBER_ACTIVE:
+		TR_MEMBERSET_SET(rdev, idx);
+		TR_ACTIVESET_SET(rdev, idx);
+		break;
+
+
+	case TR_MEMBER_SPARE:
+	case TD_RAID_MEMBER_STATE_MAX:
+		return -EINVAL;
+	}
+
+	if (rdev->ops->_handle_member)
+		rdev->ops->_handle_member(rdev, idx);
+
+	rdev->tr_generation++;
+
+	if (lock)
+		td_raid_lock(rdev);
+	td_raid_save_meta(rdev, 0);
+	if (lock)
+		td_raid_unlock(rdev);
+
+	return 0;
+};
+
+int td_raid_change_member(struct td_raid *rdev, int idx,
+		enum td_raid_member_state state)
+{
+	/* Internal things need to lock the rdev */
+	return __td_raid_change_member(rdev, idx, state, 1);
+}
+
+void __td_raid_fail_member (struct td_raid *rdev, int idx)
+{
+	struct tr_member *trm = rdev->tr_members + idx;
+
+	TR_ACTIVESET_CLEAR(rdev, idx);
+	trm->trm_state = TR_MEMBER_FAILED;
+	td_raid_err(rdev, "I/O Error on %s; FAILING device %d\n",
+			td_device_name(trm->trm_device), idx);
+
+	if (rdev->ops->_fail_member)
+		rdev->ops->_fail_member(rdev, idx);
+
+	rdev->tr_generation++;
+
+}
+
+int td_raid_fail_member (struct td_raid *rdev, int idx)
+{
+	struct tr_member *trm = rdev->tr_members + idx;
+
+	if (trm->trm_state == TR_MEMBER_FAILED)
+		return 0;
+
+	__td_raid_fail_member(rdev, idx);
+
+	td_raid_lock(rdev);
+	td_raid_save_meta(rdev, 0);
+	td_raid_unlock(rdev);
+
+	return 0;
+}
+
+static void td_raid_init_member(struct td_raid *rdev, int member_idx,
+		struct td_device *dev, enum td_raid_member_state state)
 {
 	struct tr_member *trm = rdev->tr_members + member_idx;
-	int rc;
 
 	td_device_hold(dev);
 
 	trm->trm_device = dev;
 	memcpy(trm->trm_uuid, dev->os.uuid, TD_UUID_LENGTH);
-	trm->trm_state = TR_MEMBER_ACTIVE;
-	rdev->tr_member_mask |= (1ULL<<member_idx);
 
-	trm->ucmd = kmalloc(sizeof(struct td_ucmd), GFP_KERNEL);
-	BUG_ON(trm->ucmd == NULL);
+	dev->td_raid = rdev;
 
-	td_ucmd_init(trm->ucmd);
-	/* this extra GET means it stays around forever */
-	td_ucmd_get(trm->ucmd);
+	/* Save a UCMD for emergency */
+	trm->trm_ucmd = td_ucmd_alloc(TD_PAGE_SIZE);
+	BUG_ON(trm->trm_ucmd == NULL);
 
-	trm->ucmd->ioctl.data_len_to_device = 4096;
-	trm->ucmd->ioctl.data_len_from_device = 0;
-	trm->ucmd->ioctl.data = rdev->tr_meta_page;
-	rc = td_ucmd_map(trm->ucmd, NULL, (unsigned long) trm->ucmd->ioctl.data);
-	BUG_ON(rc);
+	trm->trm_ucmd->ioctl.data_len_to_device = TD_PAGE_SIZE;
+	trm->trm_ucmd->ioctl.data_len_from_device = 0;
 
 	/* And finally, device is now officially a raid member */
 	td_device_enter_state(dev, RAID_MEMBER);
+	trm->trm_state = state;
+
+	TR_MEMBERSET_SET(rdev, member_idx);
+
+	trm->trm_counter[TR_MEMBER_COUNT_REQ] = 0xd1ab10;
+	trm->trm_counter[TR_MEMBER_COUNT_ERROR] = 0xc0ffee;
+
+	if (state == TR_MEMBER_ACTIVE)
+		TR_ACTIVESET_SET(rdev, member_idx);
+	else
+		TR_ACTIVESET_CLEAR(rdev, member_idx);
+
+	td_raid_info(rdev, "dev [%s] added as member %d: %s\n",
+		td_device_name(dev), member_idx, tr_member_state_name(state));
+
+
 }
 
-
-int td_raid_add_member(struct td_raid *rdev, struct td_device *dev)
+static void td_raid_apply_metadata (struct td_raid *rdev,
+		struct tr_meta_data_struct *md, int redo)
 {
 	int i;
 
-	WARN_TD_DEVICE_UNLOCKED(rdev);
+	if (redo) {
+		/* We need to verify the conf, in theory, this can never change */
+		for (i = 0; i < TR_META_DATA_CONF_MAX; i++) {
+			struct td_ioctl_conf_entry *c = md->raid_info.conf + i;
+			uint64_t cval;
 
-	for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
-		struct tr_member *trm = rdev->tr_members + i;
-		struct td_engine *eng;
-
-		if (trm->trm_device)
-			continue;
-
-		/* This not should be marked as present */
-		WARN_ON(rdev->tr_member_mask & 1<<i);
-
-		eng = td_device_engine(dev);
-
-		/* Make sure it's in a state to be ready for online */
-		if (td_eng_hal_online(eng)) {
-			td_raid_err(rdev, "Device '%s' not ready for raid\n", td_device_name(dev));
-			break;
-		}
-
-
-		if (rdev->ops->_check_member) {
-			if (rdev->ops->_check_member(rdev, dev, rdev->tr_member_mask == 0) ) {
-				td_raid_err(rdev, "Device '%s' not compatible for raid\n", td_device_name(dev));
+			if (c->type == TD_RAID_CONF_INVALID)
 				break;
+
+			if (td_raid_get_conf(rdev, c->type, c->var, &cval) ) {
+				td_raid_info(rdev, "apply: unknown %u:%u =%llu\n",
+					c->type, c->var, c->val);
+				continue;
 			}
+
+			if (c->val == cval)
+				continue;
+
+			td_raid_err(rdev, "Apply: Mismatch conf: %u:%u = %llu\n",
+					c->type, c->var, c->val);
 		}
-		
-		td_raid_update_member(rdev, i, dev);
-		return 0;
 	}
 
-	return -EINVAL;
+	/* And we always increase our generation when we re-make it */
+	rdev->tr_generation = md->signature.generation + 1;
+
+	for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
+		struct tr_member *trm;
+		if (1) {
+			char buffer[64];
+			td_raid_format_uuid(md->member[i].uuid, buffer);
+			td_raid_info(rdev, "DEV %d: %s [%x]\n",
+				i, buffer, md->member[i].state);
+		}
+
+		trm = rdev->tr_members + i;
+
+		/* initialize members to empty. as the remaining
+		 * members are discovered, their state is converted to
+		 * active or failed depending on the matching of meta
+		 * data */
+		trm->trm_state = TR_MEMBER_EMPTY;
+
+		if (! redo) {
+			/* Easy case, update and go on */
+			memcpy(trm->trm_uuid, md->member[i].uuid, TD_UUID_LENGTH);
+			continue;
+		}
+
+		/*
+		 * We have a device here, we need to see if it matches this
+		 * metadata
+		 */
+		if (1) {
+			char buffer[64];
+			td_raid_format_uuid(trm->trm_uuid, buffer);
+			td_raid_info(rdev, "old %d: %s [%x]\n",
+					i, buffer, trm->trm_state);
+		}
+
+		/* Do we match? */
+		if (memcmp(trm->trm_uuid, md->member[i].uuid, TD_UUID_LENGTH) == 0) {
+			trm->trm_state = TR_MEMBER_FAILED;
+			TR_ACTIVESET_CLEAR(rdev, i);
+			td_raid_info(rdev, "Flipping %d (%s) to FAILED\n", i,
+					trm->trm_device ?
+						td_device_name(trm->trm_device):
+						"<unknown>"
+					);
+
+			continue;
+		}
+
+		if (trm->trm_device) {
+			td_raid_info(rdev, "Removing member %u: %s\n",
+					i, td_device_name(trm->trm_device));
+
+			td_device_lock(trm->trm_device);
+			trm->trm_device->td_raid = NULL;
+			td_device_enter_state(trm->trm_device, OFFLINE);
+			td_device_unlock(trm->trm_device);
+			td_device_put(trm->trm_device);
+
+			/* And we're done with it */
+			trm->trm_device = NULL;
+		}
+
+		if (trm->trm_ucmd)
+			td_ucmd_put(trm->trm_ucmd);
+		TR_ACTIVESET_CLEAR(rdev, i);
+		TR_MEMBERSET_CLEAR(rdev, i);
+	}
+
+	rdev->tr_generation = md->signature.generation+1;
+}
+
+static void td_raid_resync_wait(struct td_raid *dev)
+{
+	if (dev->resync_context.resync_task) {
+		struct task_struct *rts = dev->resync_context.resync_task;
+		if (rts)
+			kthread_stop(rts);
+		printk("Waiting for resync to stop\n");
+		while (dev->resync_context.resync_task)
+			schedule();
+	}
 }
 
 int td_raid_attach_device(struct td_raid *rdev, const char *dev_name)
 {
-	int rc;
+	int rc, i;
 	struct td_device *dev;
 
 	WARN_TD_DEVICE_UNLOCKED(rdev);
-
-	/* Check things that can fail */
-	if (!td_raid_check_state(rdev, CREATED) &&
-	    !td_raid_check_state(rdev, OFFLINE)) {
-		rc = -EBUSY;
-		pr_err("dev %s not offline\n", rdev->os.name);
-		goto error_raid_not_offline;
-	}
 
 	dev = td_device_get(dev_name);
 	if (dev == NULL) {
@@ -888,7 +1119,21 @@ int td_raid_attach_device(struct td_raid *rdev, const char *dev_name)
 	/* Lock the device, so we can control it's state */
 	td_device_lock(dev);
 
-	pr_err("%s:%d: rdev %p in state %d, dev %p\n", __func__, __LINE__, rdev, rdev->tr_state, dev);
+	if (! (td_device_check_state(dev, OFFLINE) ||
+			td_device_check_state(dev, CREATED) ) )
+	{
+		td_raid_err(rdev, "Device \"%s\" not ready for attaching\n",
+				td_device_name(dev));
+		rc = -EIO;
+		goto error_not_capable;
+	}
+
+	if (! td_run_state_check(td_device_engine(dev), RUNNING) ) {
+		td_raid_err(rdev, "Engine \"%s\" not ready for attaching\n",
+				td_device_name(dev));
+		rc = -EIO;
+		goto error_not_capable;
+	}
 
 	if (! td_eng_conf_hw_var_get(td_device_engine(dev), RAID_PAGE) ) {
 		rc = -EMEDIUMTYPE;
@@ -896,29 +1141,66 @@ int td_raid_attach_device(struct td_raid *rdev, const char *dev_name)
 		goto error_not_capable;
 	}
 
-	if (!(td_device_check_state(dev, OFFLINE) || td_device_check_state(dev, CREATED))) {
-		rc = -EBUSY;
-		pr_err("dev %s not offline: %d\n", dev_name,
-				dev->td_state);
-		goto error_dev_not_offline;
+	rc = -ESRCH;
+	for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
+		struct tr_member *trm = rdev->tr_members + i;
+		struct td_engine *eng;
+
+		/* We are looking for an empty slot */
+		if (trm->trm_device)
+			continue;
+
+		/* This not should be marked as present */
+		WARN_ON(TR_MEMBERSET_TEST(rdev, i));
+
+		eng = td_device_engine(dev);
+
+		/* Make sure it's in a state to be ready for online */
+		if (td_eng_hal_online(eng)) {
+			td_raid_err(rdev, "Device '%s' not ready for raid\n", td_device_name(dev));
+			rc = -EIO;
+			break;
+		}
+
+
+		if (rdev->ops->_check_member) {
+			if (rdev->ops->_check_member(rdev, dev) ) {
+				td_raid_err(rdev, "Device '%s' not compatible for raid\n", td_device_name(dev));
+				rc = -EIO;
+				break;
+			}
+		}
+		
+		if (TR_MEMBERSET_EMPTY(rdev) ) {
+			td_raid_info(rdev, "Empty raid initialized with %i: %s\n",
+					i, td_device_name(dev));
+			td_raid_init_member(rdev, i, dev, TR_MEMBER_ACTIVE);
+		} else {
+			td_raid_init_member(rdev, i, dev, TR_MEMBER_SYNC);
+		}
+
+		if (rdev->ops->_handle_member) {
+			if (rdev->ops->_handle_member(rdev, i) ) {
+				td_raid_err(rdev, "Error handling '%s'\n",
+						td_device_name(dev));
+				return -EIO;
+			}
+		}
+	
+		/* And since we found one, we can exit the search */
+		rc = 0;
+		break;
 	}
 
-	rc = td_raid_add_member(rdev, dev);
-	if (rc)
-		goto error_adding_member;
+	/* Something was changed */
+	td_raid_save_meta(rdev, 1);
 
+	/* Unlock and return our reference  */
 
-	td_raid_enter_state(rdev, OFFLINE);
-
-	// FIXME: member state, whole raid state?
-
-error_adding_member:
-error_dev_not_offline:
 error_not_capable:
 	td_device_unlock(dev);
 	td_device_put(dev);
 error_get_dev:
-error_raid_not_offline:
 
 	if (rc)
 		pr_err("Failed to attach device '%s' to raid '%s', error=%d.\n",
@@ -926,11 +1208,32 @@ error_raid_not_offline:
 	return rc;
 }
 
-int td_raid_del_member(struct td_raid *rdev, struct td_device *dev)
+static int td_raid_member_find(struct td_raid *rdev, const char* dev_name)
 {
-	int i;
+	int rc, i;
+	struct td_device *dev;
 
-	WARN_TD_DEVICE_UNLOCKED(rdev);
+	rc = -ENODEV;
+	/* this will get a reference to it too */
+	dev = td_device_get(dev_name);
+	if (dev == NULL) {
+		rc = -ENOENT;
+		pr_err("dev %s not found\n", dev_name);
+		return -EINVAL;
+	}
+
+	/* Lock the device for consistency */
+	td_device_lock(dev);
+
+	rc = -EINVAL;
+	if (!td_device_check_state(dev, RAID_MEMBER)) {
+		pr_err("dev %s not raid member\n", dev_name);
+		goto error_member;
+	}
+	if (dev->td_raid != rdev) {
+		td_raid_err(rdev, "dev %s not a member", dev_name);
+		goto error_member;
+	}
 
 	for (i = 0; i < tr_conf_var_get(rdev, MEMBERS); i++) {
 		struct tr_member *trm = rdev->tr_members + i;
@@ -939,73 +1242,147 @@ int td_raid_del_member(struct td_raid *rdev, struct td_device *dev)
 			continue;
 
 		/* This should be marked as present */
-		WARN_ON(! (rdev->tr_member_mask & 1<<i));
+		WARN_ON(! TR_MEMBERSET_TEST(rdev, i));
 
-		rdev->tr_member_mask ^= (1<<i);
-		/* Fond the member */
-		trm->trm_device = NULL;
-		trm->trm_state = TR_MEMBER_EMPTY;
-
-		/* this puts the extra reference we fetched */
-		td_ucmd_put(trm->ucmd);
-		mb();
-
-		/**! we need to release the device reference */
-		td_device_put(dev);
-
-		return 0;
+		/* We return this index.  The device has a reference, and is
+		 * locked, caller must manage that */
+		return i;
 	}
 
-	return -EINVAL;
+error_member:
+	td_device_unlock(dev);
+	td_device_put(dev);
+	return rc;
 }
 
 int td_raid_detach_device(struct td_raid *rdev, const char *dev_name)
 {
-	int rc;
+	int idx, sync_cnt;
 	struct td_device *dev;
+	struct tr_member *trm;
 
-	WARN_TD_DEVICE_UNLOCKED(rdev);
-
-	/* Check things that can fail */
-	if (!td_raid_check_state(rdev, CREATED) &&
-	    !td_raid_check_state(rdev, OFFLINE)) {
-		rc = -EBUSY;
-		pr_err("dev %s not offline\n", rdev->os.name);
-		goto error_raid_not_offline;
+	sync_cnt = 0;
+	for (idx = 0; idx < tr_conf_var_get(rdev, MEMBERS); idx++) {
+		if (tr_raid_member_check_state(rdev->tr_members + idx, SYNC))
+			sync_cnt++;
 	}
 
-	dev = td_device_get(dev_name);
-	if (dev == NULL) {
-		rc = -ENOENT;
-		pr_err("dev %s not found\n", dev_name);
-		goto error_get_dev;
+	/* This does a lock on the member for us when if it gets it, in
+	 * addition to the get reference */
+	idx = td_raid_member_find(rdev, dev_name);
+
+	if (idx < 0)
+		return idx;
+
+	trm = rdev->tr_members + idx;
+	dev = trm->trm_device;
+	BUG_ON(!dev);
+
+	switch (trm->trm_state) {
+	case TR_MEMBER_ACTIVE:
+		if (tr_check_dev_state(rdev, ONLINE)) {
+			td_raid_err(rdev, "Can't remove active member from online raid");
+
+			/* Unlock, and return our reference */
+			td_device_unlock(dev);
+			td_device_put(dev);
+			return -EBUSY;
+		}
+		if (sync_cnt) {
+			td_raid_err(rdev, "Can't remove active member while volume sync in progress");
+
+			/* Unlock, and return our reference */
+			td_device_unlock(dev);
+			td_device_put(dev);
+			return -EBUSY;
+		}
+
+		break;
+	case TR_MEMBER_SYNC:
+		trm->trm_state = TR_MEMBER_FAILED;
+		td_raid_resync_wait(rdev);
+		break;
+	default:
+		break;
 	}
 
-	if (!td_device_check_state(dev, RAID_MEMBER)) {
-		pr_warning("dev %s not online raid member\n", dev_name);
-	}
+	/* We alrady have the rdev lock, so we can't try to lock it*/
+	__td_raid_change_member(rdev, idx, TR_MEMBER_EMPTY, 0);
 
-	/* Lock the device for consistency */
-	td_device_lock(dev);
-
-	// FIXME: figure out offline
-	// td_device_go_offline(dev);
-
-	rc = td_raid_del_member(rdev, dev);
-	if (rc)
-		goto error_removing_member;
-
+	/* This device is now just OFFLINE */
 	td_device_enter_state(dev, OFFLINE);
+	trm->trm_device = NULL;
 
-error_removing_member:
+	if (trm->trm_ucmd) {
+		td_ucmd_put(trm->trm_ucmd);
+		trm->trm_ucmd = NULL;
+	}
+
+	/**! we need to release the main raid reference */
+	td_device_put(dev);
+
+	/* And now we unlock/return our reference */
 	td_device_unlock(dev);
 	td_device_put(dev);
-error_get_dev:
-error_raid_not_offline:
 
-	if (rc)
-		pr_err("Failed to remove device '%s' from raid '%s', error=%d.\n",
-				dev_name, rdev->os.name, rc);
+	return 0;
+}
+
+int td_raid_fail_device(struct td_raid *rdev, const char* dev_name)
+{
+	int idx, rc, sync_cnt;
+	struct td_device *dev;
+	struct tr_member *trm;
+
+	td_raid_info(rdev, "Attempt to FAIL device \"%s\"\n", dev_name);
+
+	sync_cnt = 0;
+	for (idx = 0; idx < tr_conf_var_get(rdev, MEMBERS); idx++) {
+		if (tr_raid_member_check_state(rdev->tr_members + idx, SYNC))
+			sync_cnt++;
+	}
+
+	/* This does a lock on the member for us when if it gets it, in
+	 * addition to the get reference */
+	idx = td_raid_member_find(rdev, dev_name);
+
+	if (idx < 0)
+		return idx;
+
+	trm = rdev->tr_members + idx;
+	dev = trm->trm_device;
+	BUG_ON(!dev);
+
+	switch (trm->trm_state) {
+	case TR_MEMBER_FAILED: /* no action required */
+		rc = 0;
+		goto done;
+	case TR_MEMBER_ACTIVE: /* don't fail if sync in progress */
+		if (sync_cnt) {
+			td_raid_info(rdev, "Can't FAIL active device \"%s\" while volume sync in progress\n", dev_name);
+			rc = -EBUSY;
+			goto done;
+		}
+		break;
+	default:
+		break;
+	}
+
+	__td_raid_fail_member(rdev, idx);
+
+	rc = 0;
+
+	/* Check if resync is running */
+	td_raid_resync_wait(rdev);
+
+	/* The ioctl has the rdev lock already, so we don't lock this time */
+	td_raid_save_meta(rdev, 1);
+
+done:
+	/* And now we unlock/return our reference */
+	td_device_unlock(dev);
+	td_device_put(dev);
+
 	return rc;
 }
 
@@ -1063,7 +1440,8 @@ int td_raid_get_info (struct td_raid *rdev, struct td_ioctl_raid_info *info)
 int td_raid_get_state (struct td_raid *rdev, struct td_ioctl_raid_state *state)
 {
 	int i;
-	state->state = rdev->tr_state;
+	state->run_state = rdev->tr_run_state;
+	state->dev_state = rdev->tr_dev_state;
 
 	state->storage_capacity = rdev->os.block_params.capacity;
 
@@ -1083,15 +1461,123 @@ int td_raid_get_state (struct td_raid *rdev, struct td_ioctl_raid_state *state)
 	return 0;
 }
 
+int td_raid_get_counters (struct td_raid *rdev, struct td_ioctl_counters *cntrs,
+		int fill_mode)
+{
+	// td_ioctl_device_get_counters()
+	int i, rc = -EINVAL;
+
+	WARN_TD_DEVICE_UNLOCKED(rdev);
+
+	if (fill_mode) {
+		/* determine the total number of counters */
+		i = TR_GENERAL_COUNT_MAX;
+
+		/* Member counters */
+		i += TR_MEMBER_COUNT_MAX * tr_conf_var_get(rdev, MEMBERS);
+
+		/* How many counters do our ops have */
+		i += rdev->ops_counter_max;
+
+		if (cntrs->count < i) {
+			/* the user buffer isn't big enough, return the count required */
+			cntrs->count = i;
+			rc = -ENOBUFS;
+			goto error;
+		}
+
+		cntrs->count = 0; /* increase the count in loop body */
+
+		for (i = 0 ; i < TR_GENERAL_COUNT_MAX ; i++) {
+			cntrs->entries[cntrs->count].type = TD_RAID_COUNTER_GENERAL;
+			cntrs->entries[cntrs->count].var = i;
+			cntrs->entries[cntrs->count].val = rdev->counter[i];
+
+			cntrs->count++;
+		}
+
+		for (i = 0 ; i < TR_MEMBER_COUNT_MAX ; i++) {
+			int m;
+			for (m = 0; m < tr_conf_var_get(rdev, MEMBERS); m++) {
+				struct tr_member *trm = rdev->tr_members + m;
+				cntrs->entries[cntrs->count].type = TD_RAID_COUNTER_MEMBER;
+				cntrs->entries[cntrs->count].part.var = i;
+				cntrs->entries[cntrs->count].part.id = m;
+				cntrs->entries[cntrs->count].val = trm->trm_counter[i];
+
+				cntrs->count++;
+			}
+		}
+
+		/* fill the read counters */
+		for (i = 0 ; i < rdev->ops_counter_max; i++) {
+			cntrs->entries[cntrs->count].type = TD_RAID_COUNTER_OPS;
+			cntrs->entries[cntrs->count].part.var = i;
+			cntrs->entries[cntrs->count].part.id = tr_conf_var_get(rdev, LEVEL);
+			rc = rdev->ops->_get_counter(rdev,
+					cntrs->entries[cntrs->count].part.var,
+					&cntrs->entries[cntrs->count].val);
+
+			if (rc == -ENOENT)
+				continue;
+			if (rc)
+				goto error;
+
+			cntrs->count++;
+		}
+
+		if (rc == -ENOENT)
+			rc = 0;
+	} else {
+		for (i = 0; i < cntrs->count; i++) {
+			switch (cntrs->entries[i].type) {
+			case TD_RAID_COUNTER_GENERAL:
+				if  (cntrs->entries[i].var < TR_GENERAL_COUNT_MAX)
+					cntrs->entries[i].val = rdev->counter[cntrs->entries[i].var];
+				else
+					rc = -ENOENT;
+				break;
+
+			case TD_RAID_COUNTER_MEMBER:
+				td_raid_warn(rdev, "GET_COUNTER for MEMBER not supported\n");
+				rc = -EINVAL;
+				break;
+			case TD_RAID_COUNTER_OPS:
+				if (i < rdev->ops_counter_max)
+					rc = rdev->ops->_get_counter(rdev,
+							cntrs->entries[i].var,
+							&cntrs->entries[i].val);
+				else
+					rc = -ENOENT;
+				break;
+			}
+
+			if (rc)
+				break;
+		}
+		cntrs->count = i;
+		if (rc == -ENOENT)
+			rc = 0;
+	}
+
+error:
+	return rc;
+}
+
 
 static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long raw_arg)
 {
 	int rc;
 	union {
+		struct td_ioctl_device_name             	member_name;
 		struct td_ioctl_device_list             	member_list;
 		struct td_ioctl_raid_info                       raid_info;
 		struct td_ioctl_raid_state                      raid_state;
 		struct td_ioctl_conf                            conf;
+		struct td_ioctl_counters                        counters;
+#ifdef CONFIG_TERADIMM_SGIO
+		sg_io_hdr_t sg_hdr;
+#endif
 	} __user *u_arg, *k_arg, __static_arg, *__big_arg = NULL;
 
 	unsigned copy_in_size, copy_out_size, big_size = 0;
@@ -1119,6 +1605,21 @@ static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long
 		copy_in_size = big_size;
 		if (cmd != TD_IOCTL_DEVICE_SET_CONF)
 			copy_out_size = copy_in_size;
+		break;
+
+	case TD_IOCTL_RAID_GET_COUNTERS:
+	case TD_IOCTL_RAID_GET_ALL_COUNTERS:
+		/* copy in the base structure */
+		rc = -EFAULT;
+		if (copy_from_user(k_arg, u_arg,
+					sizeof(struct td_ioctl_counters)))
+			goto bail_ioctl;
+
+		/* based on count provided, figure out how much actually */
+		big_size = TD_IOCTL_COUNTER_SIZE(k_arg->counters.count);
+
+		copy_in_size = big_size;
+		copy_out_size = copy_in_size;
 		break;
 
 	case TD_IOCTL_RAID_GET_MEMBER_LIST:
@@ -1150,6 +1651,10 @@ static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long
 		copy_in_size = big_size;
 		break;
 		
+	case TD_IOCTL_RAID_FAIL_MEMBER:
+		copy_in_size = sizeof(k_arg->member_name);
+		break;
+
 	case TD_IOCTL_RAID_GET_INFO:
 		copy_out_size = sizeof(k_arg->raid_info);
 		break;
@@ -1158,6 +1663,13 @@ static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long
 		big_size = TD_IOCTL_RAID_STATE_SIZE(tr_conf_var_get(rdev, MEMBERS));
 		copy_out_size = big_size;
 		break;
+
+#ifdef CONFIG_TERADIMM_SGIO
+	case SG_IO:
+		copy_in_size = sizeof(sg_io_hdr_t);
+		copy_out_size = sizeof(sg_io_hdr_t);
+		break;
+#endif
 
 	default:
 		/* nothing to copy in */
@@ -1203,6 +1715,9 @@ static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long
 	td_raid_lock(rdev);
 
 	switch (cmd) {
+	case TD_IOCTL_RAID_RESYNC:
+		rc = td_ioctl_raid_resync(rdev);
+		break;
 	case TD_IOCTL_RAID_GET_ALL_CONF:
 	case TD_IOCTL_RAID_GET_CONF:
 		rc = td_ioctl_raid_get_conf(rdev, &k_arg->conf,
@@ -1214,6 +1729,13 @@ static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long
 		rc = td_ioctl_raid_set_conf(rdev, &k_arg->conf);
 		break;
 #endif
+
+	case TD_IOCTL_RAID_GET_COUNTERS:
+	case TD_IOCTL_RAID_GET_ALL_COUNTERS:
+		rc = td_raid_get_counters(rdev, &k_arg->counters,
+				cmd == TD_IOCTL_RAID_GET_ALL_COUNTERS);
+		break;
+
 	case TD_IOCTL_RAID_GET_MEMBER_LIST:
 		/** ioctl used to query available device groups */
 		rc = td_raid_list_members(rdev,
@@ -1246,6 +1768,10 @@ static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long
 		rc = td_raid_detach_device(rdev, k_arg->member_list.buffer);
 		break;
 
+	case TD_IOCTL_RAID_FAIL_MEMBER:
+		rc = td_raid_fail_device(rdev, k_arg->member_name.dev_name);
+		break;
+
 	case TD_IOCTL_RAID_GET_INFO:
 		rc = td_raid_get_info(rdev, &k_arg->raid_info);
 		break;
@@ -1254,6 +1780,16 @@ static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long
 		rc = td_raid_get_state(rdev, &k_arg->raid_state);
 		break;
 
+	case TD_IOCTL_RAID_METASAVE:
+		td_raid_save_meta(rdev, 1);
+		rc = 0;
+		break;
+#ifdef CONFIG_TERADIMM_SGIO
+	case SG_IO:
+		rc = td_block_sgio(&rdev->os, &k_arg->sg_hdr);
+		break;
+#endif
+
 	default:
 		rc = -ENOIOCTLCMD;
 		break;
@@ -1261,21 +1797,31 @@ static int __td_raid_ioctl(struct td_raid* rdev, unsigned int cmd, unsigned long
 
 	td_raid_unlock(rdev);
 
-	if (rc)
+	switch(rc) {
+	case 0:
+		break;
+
+	case -ENOBUFS:
+		/* in these cases we'd like to copy_to_user so that
+		 * the user app can check the partial results and allocate
+		 * a larger buffer.
+		 */
+		break;
+
+	default:
 		goto bail_ioctl;
+	}
 
 	/* copy data back */
 
 	if (copy_out_size) {
-		rc = -EFAULT;
 		if (copy_to_user(u_arg, k_arg, copy_out_size)) {
+			rc = -EFAULT;
 			pr_err("RAID ioctl failed to copy out %u bytes.",
 					copy_out_size);
 			goto bail_ioctl;
 		}
 	}
-
-	rc = 0;
 
 bail_ioctl:
 	if (__big_arg)
@@ -1285,6 +1831,8 @@ bail_ioctl:
 
 static void __td_raid_destroy (struct td_raid *rdev)
 {
+	if (rdev->tr_members)
+		kfree(rdev->tr_members);
 	kfree(rdev);
 }
 

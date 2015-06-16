@@ -399,7 +399,7 @@ int td_cmdgen_ata (uint64_t bytes[8], uint8_t*ata_cmd, int ssd, int data_size)
 	uint16_t sector_count;
 
 	if ((ata_cmd[0] != 0x85) && (ata_cmd[0] != 0xA1)) {
-		//printk("ERROR: Not SAT ATA PT\n");
+		//printk("ERROR: Not SAT ATA PT (0x%02x)\n", ata_cmd[0]);
 		return -EINVAL;
 	}
 
@@ -566,5 +566,44 @@ int td_cmdgen_trim(uint64_t bytes[8], uint8_t ssd, uint8_t length)
 	tdcmd->cmd.decode.meta_size = TD_DEC_META_NONE;
 	tdcmd->dst.length = length;
 	
+	return 0;
+}
+
+int td_cmdgen_bio_read4k(uint64_t bytes[8], uint8_t ssd, uint64_t lba, uint16_t core_buf, uint8_t needs_meta)
+{
+	td_cmd_t *tdcmd = (td_cmd_t *)bytes;
+
+	tdcmd->cmd.id = TD_CMD_RD_PAGE;
+	tdcmd->cmd.port = ssd;
+	tdcmd->cmd.to_ssd = 1;
+	tdcmd->cmd.decode.dupcheck = 1;
+	tdcmd->cmd.decode.to_host = 1;
+	tdcmd->cmd.decode.from_host = 0;
+	tdcmd->cmd.decode.data_size = TD_DEC_DATA_4K;
+	tdcmd->cmd.decode.meta_size = needs_meta ? TD_DEC_META_128 : TD_DEC_META_NONE;
+	tdcmd->dst.bufid = core_buf;
+	tdcmd->dst.bcnt = 0;
+	tdcmd->src.lba.lba = lba;
+
+	return 0;
+}
+
+int td_cmdgen_bio_write4k(uint64_t bytes[8], uint8_t ssd, uint64_t lba, uint16_t core_buf, uint8_t needs_meta, uint16_t wep)
+{
+	td_cmd_t *tdcmd = (td_cmd_t *)bytes;
+
+	tdcmd->cmd.id = TD_CMD_WR_FINAL;
+	tdcmd->cmd.port = ssd;
+	tdcmd->cmd.to_ssd = 1;
+	tdcmd->cmd.decode.dupcheck = 1;
+	tdcmd->cmd.decode.to_host = 0;
+	tdcmd->cmd.decode.from_host = 1;
+	tdcmd->cmd.decode.data_size = TD_DEC_DATA_4K;
+	tdcmd->cmd.decode.meta_size = needs_meta ? TD_DEC_META_128 : TD_DEC_META_NONE;
+	tdcmd->src.bufid = core_buf;
+	tdcmd->src.wep = wep;
+	tdcmd->src.bcnt = 0;
+	tdcmd->dst.lba.lba = lba;
+
 	return 0;
 }

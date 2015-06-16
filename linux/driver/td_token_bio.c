@@ -50,6 +50,8 @@
  *                                                                       *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
+#include "td_kdefn.h"
+
 #include "td_token.h"
 #include "td_util.h"
 #include "td_engine.h"
@@ -69,6 +71,9 @@
  * @param dev_data_src - kernel virtual address of device buffer
  * @param dev_meta_src 
  * @return number of bytes copied
+ * 
+ * This function can completely ignore metadata buffer, since it knows
+ * it will only be multiples of 512B sectors
  *
  * Used by eng->ops->read_page when used for bio reads.
  */
@@ -77,12 +82,14 @@ int td_token_dev_to_bio(struct td_token *tok,
 		const void *dev_data_alias, const void *dev_meta_alias)
 {
 	struct td_engine *eng = td_token_engine(tok);
-	int to_copy;
+	int to_copy, rc;
 	uint accumulated = 0;
 	const char *src = dev_data_src;
 	const char *alias = dev_data_alias;
+	char *cache;
 	struct bio_vec bvec;
 	td_bvec_iter i;
+	int use_read_aliases;
 
 	/* If we have LBA_OFS, we need to adjust the src */
 	src += tok->lba_ofs;
@@ -95,6 +102,11 @@ int td_token_dev_to_bio(struct td_token *tok,
 	if (td_cache_flush_test(eng, PRE, RDBUF))
 		mb();
 	}
+
+	use_read_aliases = td_eng_conf_var_get(eng, USE_READ_ALIASES);
+	cache = eng->td_read_data_cache + (PAGE_SIZE * tok->rd_bufid);
+	if (use_read_aliases >= 2 && !eng->td_read_data_cache)
+		use_read_aliases = 1;
 
 	td_bio_for_each_segment(bvec, tok->host.bio, i) {
 		char *dst;
@@ -109,17 +121,101 @@ int td_token_dev_to_bio(struct td_token *tok,
 
 		if (!TD_MAPPER_TYPE_TEST(READ_DATA, WB)) {
 			/* optimized read fro WC/UC mapping */
-			td_memcpy_movntdqa_64(dst, src, copy_len);
-
-		} else if (td_cache_flush_exact_test(eng,PRE,NTF,RDBUF)) {
-			/* cached mapping; read buffer was already filled
-			 * with the fill word with NT-writes */
-			void const * const src_alias[2] = {src, alias};
-			td_memcpy_8x8_movq_bad_clflush(dst, src_alias,
-					copy_len, TERADIMM_NTF_FILL_WORD);
+			switch (use_read_aliases) {
+			default:
+				/* copy from source to dest */
+				td_memcpy_movntdqa_64(dst, src, copy_len);
+				break;
+			case 1:
+				/* read source and alias, if equal write to
+				 * dest, otherwise fail */
+				rc = td_memcpy_movntdqa_64_alias_compare(
+						dst, src, alias, copy_len);
+				if (rc<0)
+					goto bail;
+				break;
+			case 2:
+				/* read from source and cache, if different
+				 * read from alias, write to destination */
+				td_memcpy_movntdqa_64_cached_alias_compare(
+						dst, src, cache, alias, copy_len);
+				break;
+			case 3:
+				/* read from source and cache, if different
+				 * read from alias, if alias differs from
+				 * source fail, otherwise write to dest */
+				rc = td_memcpy_movntdqa_64_cached_alias_compare_test(
+						dst, src, cache, alias, copy_len);
+				td_eng_trace(eng, TR_TOKEN, "DI:dev2bio:compare", rc);
+				switch(rc) {
+				case 0:
+					break;
+				case 1:
+					td_eng_counter_token_inc(eng, RDBUF_ALIAS_DUPLICATE);
+					break;
+				case -1:
+					td_eng_counter_token_inc(eng, RDBUF_ALIAS_CORRECTION);
+					break;
+				}
+				break;
+			}
 		} else {
-			/* cached mapping; builtin memcpy */
-			memcpy(dst, src, copy_len);
+			/* cached read fom WB mapping */
+			switch (use_read_aliases) {
+			default:
+				if (td_cache_flush_exact_test(eng,PRE,NTF,RDBUF)) {
+					/* cached mapping; read buffer was already filled
+					* with the fill word with NT-writes */
+					void const * const src_alias[2] = {src, alias};
+					if (0) td_eng_info(eng, "D2B: WB[%d] %s\n", use_read_aliases, "td_memcpy_8x8_movq_bad_clflush");
+					td_memcpy_8x8_movq_bad_clflush(dst, src_alias,
+							copy_len, TERADIMM_NTF_FILL_WORD);
+				} else {
+					/* cached mapping; builtin memcpy */
+					memcpy(dst, src, copy_len);
+				}
+				break;
+			case 1:
+				/* read source and alias, if equal write to
+				 * dest, otherwise fail */
+				if (0) td_eng_info(eng, "D2B: WB[%d] %s\n", use_read_aliases, "td_memcpy_alias_compare");
+				rc = td_memcpy_alias_compare(
+						dst, src, alias, copy_len);
+				if (rc<0)
+					goto bail;
+				break;
+			case 2:
+				/* read from source and cache, if different
+				 * read from alias, write to destination */
+				if (0) td_eng_info(eng, "D2B: WB[%d] %s\n", use_read_aliases, "td_memcpy_cached_alias_compare");
+				td_memcpy_cached_alias_compare(
+						dst, src, cache, alias, copy_len);
+				break;
+			case 3:
+				/* Need a block for our src_alias */
+				do {
+					/* read from source and cache, if different
+					 * read from alias, if alias differs from
+					 * source, track */
+					void const * const src_alias[2] = {src, alias};
+
+					if (0) td_eng_info(eng, "D2B: WB[%d] %s\n", use_read_aliases, "td_memcpy_cached_alias_compare_test");
+					td_eng_trace(eng, TR_DI, "DI:compare_test:tok", tok->tokid);
+					rc = td_memcpy_cached_alias_compare_test(dst, src_alias, cache, copy_len);
+					if (0) td_eng_info(eng, "  - rc %d [%016llx]\n", rc, *(uint64_t*)cache);
+					switch(rc) {
+					case 0:
+						break;
+					case 1:
+						td_eng_counter_token_inc(eng, RDBUF_ALIAS_DUPLICATE);
+						break;
+					case -1:
+						td_eng_counter_token_inc(eng, RDBUF_ALIAS_CORRECTION);
+						break;
+					}
+				} while (0);
+				break;
+			}
 		}
 
 		if (src == dev_data_src)
@@ -130,11 +226,14 @@ int td_token_dev_to_bio(struct td_token *tok,
 
 		src += copy_len;            /* advance source */
 		alias += copy_len;            /* advance source */
+		cache += copy_len;
 		to_copy -= copy_len;        /* fewer bytes to copy */
 		accumulated += copy_len;    /* account for copied bytes */
 	}
 
-	return accumulated;
+	rc = accumulated;
+bail:
+	return rc;
 }
 
 /* local helper that can copy to one or two device buffers,

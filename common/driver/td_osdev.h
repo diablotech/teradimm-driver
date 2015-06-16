@@ -63,6 +63,7 @@
 #include "td_util.h"
 #include "td_cpu.h"
 #include "td_eng_conf.h"
+#include "td_eng_counters.h"
 #include "td_ioctl.h"
 #include "td_eng_latency.h"
 #include "td_token.h"
@@ -185,8 +186,6 @@ extern int td_osdev_register (struct td_osdev* dev);
 extern int td_osdev_online (struct td_osdev* dev);
 extern int td_osdev_offline (struct td_osdev* dev);
 extern void td_osdev_unregister (struct td_osdev* dev);
-
-extern void td_osdev_error_bio (td_bio_ref);
 
 extern int td_osdev_list_iter(
 		int (*action)(struct td_osdev *dev, void *data),

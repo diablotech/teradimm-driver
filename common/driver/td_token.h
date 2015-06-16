@@ -111,7 +111,7 @@ static inline void td_multi_target_add(struct td_multi_target *mt,
 		void *data, void *meta)
 {
 	unsigned idx = mt->used ++;
-	WARN_ON(idx > TD_MULTI_TARGET_MAX);
+	BUG_ON(idx > TD_MULTI_TARGET_MAX);
 	mt->buf[ idx ].data = data;
 	mt->buf[ idx ].meta = meta;
 }

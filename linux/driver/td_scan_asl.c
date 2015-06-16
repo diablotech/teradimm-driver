@@ -489,15 +489,19 @@ static void td_scan_dmi_walk_callback(const struct dmi_header *dm,
 	struct td_scan_mem_dmi_entry *memdev =
 		(struct td_scan_mem_dmi_entry*)dm;
 
+	const char* dev_type = "   ";
 	char *part_num, *locator;
 	struct list_head *pos;
 	struct td_device_info* tmp;
 
+	if (memdev->type != DMI_ENTRY_MEM_DEVICE)
+		goto wrong_type;
+	
+	if (memdev->length < sizeof(struct td_scan_mem_dmi_entry))
+		goto too_short;
+
 	if (!memdev->size)
 		goto no_size;
-
-	if (memdev->length < 0x13)
-		goto too_short;
 
 	/* Keep track of the slowest non-zero memory speed we see. */
 	if (memdev->conf_mem_clk_speed &&
@@ -505,38 +509,36 @@ static void td_scan_dmi_walk_callback(const struct dmi_header *dm,
 		td_min_conf_mem_clk_speed = memdev->conf_mem_clk_speed;
 	}
 
-	if (dm->type == DMI_ENTRY_MEM_DEVICE) {
-		const char* dev_type = "   ";
-		part_num = td_scan_dmi_string(dm, memdev->part_number);
-		locator = td_scan_dmi_string(dm, memdev->bank_locator);
-		if (!part_num)
-			goto no_part_num;
+	part_num = td_scan_dmi_string(dm, memdev->part_number);
+	locator = td_scan_dmi_string(dm, memdev->bank_locator);
+	if (!part_num)
+		goto no_part_num;
 
-		if (!locator)
-			goto no_locator;
+	if (!locator)
+		goto no_locator;
 
-		if (strncmp(part_num, DMI_MEGADIMM,
-					strlen(DMI_MEGADIMM)) == 0) {
-			dev_type = "md";
-		} else if (strncmp(part_num, DMI_TERADIMM_LITE,
-					strlen(DMI_TERADIMM_LITE)) == 0) {
-			dev_type = "td";
-		} else {
-			goto not_dti_device;
-		}
+	if (strncmp(part_num, DMI_MEGADIMM,
+				strlen(DMI_MEGADIMM)) == 0) {
+		dev_type = "md";
+	} else if (strncmp(part_num, DMI_TERADIMM_LITE,
+				strlen(DMI_TERADIMM_LITE)) == 0) {
+		dev_type = "td";
+	} else {
+		goto not_dti_device;
+	}
 
-		list_for_each(pos, &td_device_info_list) {
-			tmp = list_entry(pos, struct td_device_info, link);
-			if (strncmp(tmp->bank_locator,
-				    locator, TD_LOCATOR_SIZE) == 0) {
-				snprintf(tmp->device_type, 3, dev_type);
-				tmp->memspeed = memdev->conf_mem_clk_speed;
-			}
+	list_for_each(pos, &td_device_info_list) {
+		tmp = list_entry(pos, struct td_device_info, link);
+		if (strncmp(tmp->bank_locator,
+			    locator, TD_LOCATOR_SIZE) == 0) {
+			snprintf(tmp->device_type, 3, dev_type);
+			tmp->memspeed = memdev->conf_mem_clk_speed;
 		}
 	}
 
 no_locator:
 no_part_num:
+wrong_type:
 too_short:
 no_size:
 not_dti_device:

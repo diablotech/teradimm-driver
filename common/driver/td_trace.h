@@ -111,6 +111,7 @@ enum td_trace_type {
 	TR_SCOUT	=	1UL<<23,
 
 	TR_VMK_AIDAN	=	1UL<<24,
+	TR_DI           =       1UL<<25,
 
 	TR_MAX          =       1UL<<31,
 };

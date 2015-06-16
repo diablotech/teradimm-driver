@@ -59,7 +59,7 @@
 /** max length (including zero-termination) of a device group name */
 #define TD_DEVGROUP_NAME_MAX 16
 
-#define TD_DEVGROUP_THREAD_NAME_PREFIX "td/"
+#define TD_THREAD_NAME_PREFIX "td/"
 
 #define TD_DEVICE_NAME_PREFIX "td"     /** devices are named /dev/td[a-z]+ */
 #define TD_DEVICE_NAME_MAX 16          /** max length (including zero-termination) of a device name */
@@ -240,6 +240,8 @@ enum td_eng_regs {
 	TD_CONF_INCOMING_SLEEP,         /**< incoming queue sleep threshold; no more are accepted */
 	TD_CONF_INCOMING_WAKE,          /**< incoming queue wake-up threshold */
 
+	TD_CONF_USE_READ_ALIASES,       /**< allow read buffer aliases in read_page */
+
 	/* END */
 	TD_CONF_REGS_MAX
 };
@@ -319,6 +321,8 @@ enum td_dev_token_counter {
 	TD_DEV_TOKEN_LOST_REFRESH_CNT,              /* !< number of times a lost token had to be refreshed */
 	TD_DEV_TOKEN_NOUPDATE_CNT,                  /* !< number of inflight command */
 	TD_DEV_TOKEN_NOUPDATE_LIMIT_REACHED,        /* !< number of times the number of inflight/not-updated tokens exceeded limit */
+	TD_DEV_TOKEN_RDBUF_ALIAS_DUPLICATE,         /* !< number of times read buffer alias was read to find duplicate data */
+	TD_DEV_TOKEN_RDBUF_ALIAS_CORRECTION,        /* !< number of times read buffer alias was used to correct data */
 	TD_DEV_TOKEN_COUNT_MAX
 
 };
@@ -364,8 +368,8 @@ enum td_devgroup_conf_worker {
 	TD_DEVGROUP_CONF_WORKER_MAX_LOOPS,
 	TD_DEVGROUP_CONF_WORKER_WITHOUT_DEVS_NSEC,
 	_deprecated_TD_DEVGROUP_CONF_WORKER_SHARE_ENDIO_NSEC,
-	TD_DEVGROUP_CONF_WORKER_SHARE_NSEC,
-	TD_DEVGROUP_CONF_WORKER_RELEASE_NSEC,
+	TD_DEVGROUP_CONF_WORKER_IDLE_SHARE_NSEC,
+	TD_DEVGROUP_CONF_WORKER_BUSY_SHARE_NSEC,
 	TD_DEVGROUP_CONF_WORKER_FORCE_RELEASE_NSEC,
 	TD_DEVGROUP_CONF_WORKER_DEV_IDLE_JIFFIES,
 	TD_DEVGROUP_CONF_WORKER_DEV_WAIT_JIFFIES,
@@ -380,6 +384,7 @@ enum td_devgroup_conf_worker {
 /* Start of Device Group Counter enums */
 enum td_devgroup_counter_type {
 	TD_DEVGROUP_COUNTER_ENDIO,
+	TD_DEVGROUP_COUNTER_NODE,
 	TD_DEVGROUP_COUNTER_WORKER,
 	TD_DEVGROUP_COUNTER_TYPE_MAX
 };
@@ -395,18 +400,27 @@ enum td_devgroup_endio_counter {
 	TD_DEVGROUP_ENDIO_COUNT_MAX
 };
 
+/* Device Group Node Counters */
+enum td_devgroup_node_counter {
+	TD_DEVGROUP_NODE_COUNT_STATE_ACTIVE,
+	TD_DEVGROUP_NODE_COUNT_STATE_WAITING,
+	TD_DEVGROUP_NODE_COUNT_STATE_IDLE,
+	TD_DEVGROUP_NODE_COUNT_MAX
+};
+
 /* Device Group Worker Counters */
 enum td_devgroup_worker_counter {
 	TD_DEVGROUP_WORKER_COUNT_LOOP1,
 	TD_DEVGROUP_WORKER_COUNT_LOOP2,
 	TD_DEVGROUP_WORKER_COUNT_LOOP3,
-	TD_DEVGROUP_WORKER_COUNT_EXIT_CORRECTLY,
-	TD_DEVGROUP_WORKER_COUNT_EXIT_ENDIO,
+	TD_DEVGROUP_WORKER_COUNT_EXIT_NO_DEVICES,
 	TD_DEVGROUP_WORKER_COUNT_EXIT_FINAL,
 	TD_DEVGROUP_WORKER_COUNT_EXIT_IDLE,
+	TD_DEVGROUP_WORKER_COUNT_EXIT_SHARED,
 	TD_DEVGROUP_WORKER_COUNT_WAKE_CHECK,
-	TD_DEVGROUP_WORKER_COUNT_NO_WAKE_EARLY,
 	TD_DEVGROUP_WORKER_COUNT_NO_WAKE_TOKEN,
+	TD_DEVGROUP_WORKER_COUNT_SHARE_IDLE,
+	TD_DEVGROUP_WORKER_COUNT_SHARE_BUSY,
 	TD_DEVGROUP_WORKER_COUNT_MAX
 };
 
@@ -468,6 +482,9 @@ enum td_eng_mcefree_reg {
 	TD_CONF_MCEFREE_STATUS_R2P_CLIMB_NSEC,  /*< increases hold time by this much */
 	TD_CONF_MCEFREE_STATUS_R2P_DROP_NSEC,   /*< decreases hold time by this much */
 	TD_CONF_MCEFREE_STATUS_R2P_COOL_MSEC,   /*< start dropping after this time */
+
+	TD_CONF_MCEFREE_STATUS_REQ_FLUSH,       /*< enables flushing of the WC buffer after request is sent */
+	TD_CONF_MCEFREE_RDMETA_FLUSH,           /*< enables flushing readbuffer metadata buffer for completing reads */
 
 	TD_CONF_MCEFREE_REGS_MAX,
 };
@@ -539,15 +556,7 @@ enum td_device_state_type {
 	TD_DEVICE_STATE_TYPE_MAX
 };
 
-enum td_raid_state_type {
-	TD_RAID_STATE_CREATED = -1,
-	TD_RAID_STATE_OFFLINE,
-	TD_RAID_STATE_OPTIMAL,
-	TD_RAID_STATE_DEGRADED,
-	TD_RAID_STATE_RESYNC,
-	TD_RAID_STATE_FAILED,
-	TD_RAID_STATE_TYPE_MAX
-};
+
 
 /** the engine can be in one of these run-time states */
 enum td_engine_run_state {
@@ -628,6 +637,21 @@ enum td_engine_run_state {
 	TD_RUN_STATE_MAX
 };
 
+enum td_raid_dev_state {
+	TD_RAID_STATE_CREATED = -1,
+	TD_RAID_STATE_OFFLINE = 0,
+	TD_RAID_STATE_ONLINE,
+	TD_RAID_STATE_TYPE_MAX
+};
+
+enum td_raid_run_state {
+	TR_RUN_STATE_UNKNOWN = -1,
+	TR_RUN_STATE_OPTIMAL = 0,
+	TR_RUN_STATE_DEGRADED,
+	TR_RUN_STATE_FAILED,
+	TR_RUN_STATE_MAX
+};
+
 /** enumerates different types of buffers */
 
 enum td_buf_type {
@@ -659,6 +683,7 @@ enum td_raid_member_state {
 	TR_MEMBER_ACTIVE,
 	TR_MEMBER_FAILED,
 	TR_MEMBER_SPARE,
+	TR_MEMBER_SYNC,
 	TD_RAID_MEMBER_STATE_MAX
 };
 
@@ -672,17 +697,60 @@ enum td_raid_conf_type {
 enum tr_general_conf_type {
 	TR_CONF_GENERAL_LEVEL    = 0,
 	TR_CONF_GENERAL_MEMBERS,
+	TR_CONF_GENERAL_GENERATION,
+	TR_CONF_GENERAL_TIMESTAMP,
+	TR_CONF_GENERAL_BIO_SECTOR_SIZE,
+	TR_CONF_GENERAL_HW_SECTOR_SIZE,
+	TR_CONF_GENERAL_CAPACITY,
+	TR_CONF_GENERAL_BIO_MAX_BYTES,
 	TR_CONF_GENERAL_MAX
 };
 
 enum tr_stripe_conf_type {
 	TR_CONF_STRIPE_STRIDE    = 0,
+	TR_CONF_STRIPE_DEV_LBAS,
+	TR_CONF_STRIPE_DEV_STRIDE,
 	TR_CONF_STRIPE_MAX
 };
 
 enum tr_mirror_conf_type {
 	TR_CONF_MIRROR_UNUSED    = 0,
 	TR_CONF_MIRROR_MAX
+};
+
+/* Start of Device Group Counter enums */
+enum td_raid_counter_type {
+	TD_RAID_COUNTER_GENERAL  = 0,
+	TD_RAID_COUNTER_MEMBER,
+	TD_RAID_COUNTER_OPS,
+	TD_RAID_COUNTER_TYPE_MAX,
+};
+
+enum tr_general_counter_type {
+	TR_GENERAL_COUNT_EVENT   = 0,
+	TR_GENERAL_COUNT_MAX,
+};
+
+enum tr_member_counter_type {
+	TR_MEMBER_COUNT_REQ      = 0,
+	TR_MEMBER_COUNT_ERROR,
+	TR_MEMBER_COUNT_MAX,
+};
+
+enum tr_mirror_counter_type {
+	TR_MIRROR_COUNT_REQ      = 0,
+	TR_MIRROR_COUNT_RESYNC_NEXT,
+	TR_MIRROR_COUNT_RESYNC_DONE,
+	TR_MIRROR_COUNT_RESYNC_LAST,
+	TR_MIRROR_COUNT_RESYNC_SRC,
+	TR_MIRROR_COUNT_RESYNC_DST,
+	TR_MIRROR_COUNT_MAX,
+};
+
+enum tr_stripe_counter_type {
+	TR_STRIPE_COUNT_REQ      = 0,
+	TR_STRIPE_COUNT_ERROR,
+	TR_STRIPE_COUNT_MAX,
 };
 
 struct td_uuid {

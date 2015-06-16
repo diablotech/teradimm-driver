@@ -56,7 +56,7 @@
 #include "td_engine.h"
 #include "td_eng_hal.h"
 #include "td_osdev.h"
-#include "td_biogrp.h"
+#include "td_bio.h"
 
 #include <linux/kernel.h>
 #include <linux/blkdev.h>
@@ -68,71 +68,87 @@
 
 
 
+static void td_device_bio_cb (struct td_biogrp *bg, td_bio_ref bio, void *opaque)
+{
+	struct td_engine *eng = opaque;
+	int rc;
+
+	rc = td_engine_queue_bio(eng, bio);
+	if (rc < 0) {
+		td_bio_endio(NULL, bio, rc, 0);
+	}
+}
+
 /*
  * Request entry point for single device block requests
+ * - This gets split and goes directly to the engine
  */
+static void td_device_bio (struct td_device *dev, struct bio* bio)
+{
+	struct td_engine *eng = td_device_engine(dev);
+
+	if (unlikely (! td_bio_is_discard(bio) &&
+			td_bio_page_span(bio, TERADIMM_DATA_BUF_SIZE) > 1))
+	{
+		/* We have to split this for the engine */
+		int rc = td_bio_split(bio, TERADIMM_DATA_BUF_SIZE, td_device_bio_cb, eng);
+		if (unlikely(rc < 0))
+			__bio_endio(bio, rc);
+		return;
+	} else {
+		/* We can give this directly to the engine */
+		td_device_bio_cb(NULL, bio, eng);
+	}
+}
 #ifdef KABI__make_request_fn_returns_void
-void td_device_make_request (struct request_queue *q, struct bio* bio)
+void td_device_make_request (struct request_queue* q, struct bio* bio)
 {
 	struct td_device *dev = td_device_from_os(q->queuedata);
-	struct td_engine *eng = &dev->td_engine;
-
-	(void)td_engine_queue_bio(eng, bio);
+	td_device_bio(dev, bio);
 }
 #else
 int td_device_make_request (struct request_queue* q, struct bio* bio)
 {
 	struct td_device *dev = td_device_from_os(q->queuedata);
-	struct td_engine *eng = &dev->td_engine;
-
-	return td_engine_queue_bio(eng, bio);
+	td_device_bio(dev, bio);
+	return 0;
 }
 #endif
 
 void td_device_bio_error (struct td_osdev *odev, td_bio_ref bio)
 {
-	td_os_err(odev, "BIO: Error on bio %p\n", bio);
+	//td_os_err(odev, "BIO: Device error on bio %p\n", bio);
 }
 
 void td_raid_bio_error (struct td_osdev *odev, td_bio_ref bio)
 {
-	td_os_err(odev, "BIO: Error on bio %p\n", bio);
+	//td_os_err(odev, "BIO: RAID error on bio %p\n", bio);
 }
 
 /*
  * Request entry point for raid device block requests
  */
+void td_raid_bio (struct td_raid *rdev, struct bio *bio)
+{
+	if ( rdev->ops->_request(rdev, bio) < 0) {
+		__bio_endio(bio, -EIO);
+	}
+}
+
 #ifdef KABI__make_request_fn_returns_void
 void td_raid_make_request (struct request_queue *q, struct bio* bio)
 {
 	struct td_raid *rdev = td_raid_from_os(q->queuedata);
-
-
-	if ( rdev->ops->_request(rdev, bio) < 0) {
-#if KABI__bio_endio == 3
-		bio_endio(bio, 0, -EIO);
-#else
-		bio_endio(bio, -EIO);
-#endif
-	}
+	td_raid_bio(rdev, bio);
 }
 #else
-int td_raid_make_request (struct request_queue* q, struct bio* bio)
+int td_raid_make_request (struct request_queue *q, struct bio* bio)
 {
 	struct td_raid *rdev = td_raid_from_os(q->queuedata);
-	
-	if ( rdev->ops->_request(rdev, bio) < 0) {
-#if KABI__bio_endio == 3
-		bio_endio(bio, 0, -EIO);
-#else
-		bio_endio(bio, -EIO);
-#endif
-		return -EIO;
-	}
+	td_raid_bio(rdev, bio);
 	return 0;
 }
 #endif
-
 
 /* This is a messy import from td_device.c */
 static int __check_dev_bdisk (struct td_osdev* dev, void* data)
@@ -376,6 +392,7 @@ int td_linux_block_create(struct td_osdev *dev)
 	td_os_err(dev, "No kernel API for optimal IO size\n");
 #endif
 
+#if 0
 	if (dev->block_params.discard)
 	{
 		int did_something = 0;
@@ -406,6 +423,11 @@ int td_linux_block_create(struct td_osdev *dev)
 	} else {
 		td_os_info(dev, "No DISCARD support enabled\n");
 	}
+#else
+	/* bug 7444 */
+	if (dev->block_params.discard)
+		td_os_info(dev, "Device supports DISCARD but is currently being forced disabled\n");
+#endif
 
 	/*  assign */
 	dev->queue = queue;
@@ -435,6 +457,7 @@ static int td_osdev_os_register_platform_device(struct td_osdev *dev)
 	struct platform_device *pdev = &dev->pdevice;
 	int rc;
 
+printk("PM: register (%s)\n", dev->name);
 	WARN_DEVICE_UNLOCKED(dev);
 
 	memset(pdev, 0, sizeof(*pdev));
@@ -458,6 +481,7 @@ error_plat_register:
 static void td_osdev_os_unregister_platform_device(struct td_osdev *dev)
 {
 	WARN_DEVICE_UNLOCKED(dev);
+printk("PM: unregister (%s)\n", dev->name);
 	platform_device_unregister(&dev->pdevice);
 }
 
@@ -479,6 +503,8 @@ int td_linux_block_register(struct td_osdev *dev, int major)
 	int rc;
 	int first_minor;
 	struct gendisk *disk;
+	
+td_os_info(dev, "LINUX_BLOCK_REGISTER\n");
 
 	/* WARN_TD_DEVICE_UNLOCKED(dev); */
 	WARN_ON(!dev->queue);
@@ -542,10 +568,15 @@ int td_linux_block_unregister(struct td_osdev *dev)
 	WARN_DEVICE_UNLOCKED(dev);
 	WARN_ON(atomic_read(&dev->block_users));
 
+td_os_info(dev, "LINUX_BLOCK_UNREGISTER\n");
+
 	if (dev->disk) {
 		del_gendisk(dev->disk);
 		put_disk(dev->disk);
 		dev->disk = NULL;
+	} else {
+		printk("block_unregister without disk\n");
+		WARN_ON(1);
 	}
 #ifdef CONFIG_PM
 	td_osdev_os_unregister_platform_device(dev);

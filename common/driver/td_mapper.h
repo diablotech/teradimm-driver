@@ -69,6 +69,7 @@ extern int td_hw_cmd_uc;
 struct td_mapper {
 	uint64_t        phys_base;
 	uint64_t        phys_size;
+	uint64_t        phys_avoid_mask;
 
 	struct {
 #define TERADIMM_CACHED_ALIASES_READ_DATA 2
@@ -96,14 +97,15 @@ struct td_mapper {
 
 extern int td_mapper_check_memory_mapping(const char *dev_name, uint64_t base, uint64_t size);
 
-extern int td_mapper_init(struct td_mapper *m, const char *dev_name, uint64_t base, uint64_t size);
+extern int td_mapper_init(struct td_mapper *m, const char *dev_name, uint64_t base,
+		uint64_t size, uint64_t avoid_mask);
 extern void td_mapper_cleanup(struct td_mapper *m);
 
 extern int td_mapper_verify_ready(struct td_mapper *m);
 
 static inline uint64_t td_mapper_max_offset(struct td_mapper *m)
 {
-	return min_t(uint64_t, m->phys_size, TD_IOREMAP_SIZE);
+	return min_t(uint64_t, m->phys_size, TERADIMM_ADDRESS_MAX);
 }
 
 /* these are defined per platform in td_mapper_{platform}.c */

@@ -114,30 +114,20 @@ void td_cmd_ata_extract_cmd(td_cmd_t *tdcmd, uint8_t *ata_cmd) {
 int td_cmd_ata_ok(td_cmd_t *tdcmd){
 	uint8_t ata_cmd[16];
 	td_cmd_ata_extract_cmd(tdcmd, ata_cmd);
-	return td_cmd_ata_filter(ata_cmd);
+	return td_cmd_scsi_filter(ata_cmd);
 }
 
-int td_cmd_ata_filter(uint8_t *ata_cmd)
+int td_cmd_scsi_filter(uint8_t *scsi_cmd)
 {
 	int rc = -EINVAL;
 
-	/* IDENTIFY */
-	if (0x12 == ata_cmd[0]) {
-		switch (ata_cmd[2]) {
-		case 0x00:
-		case 0x80:
-		case 0x83:
-			rc = 0;
-			break;
-		default:
-			goto fail;
-			break;
-		}
+	switch (scsi_cmd[0]) {
+	case INQUIRY: { /* INQUIRY */
+		rc = 0;
+		break;
 	}
-
-	/* ATA_16 pass-through (0x85) */
-	if (ATA_16 == ata_cmd[0]) {
-		switch (ata_cmd[14]) {
+	case ATA_16: { /* ATA_16 pass-through (0x85) */
+		switch (scsi_cmd[14]) {
 		case 0xEC: /* Identify Device */
 		case 0xB0: /* smart */
 		case 0xF3: /* Security Erase Prepare*/
@@ -146,22 +136,25 @@ int td_cmd_ata_filter(uint8_t *ata_cmd)
 			rc = 0;
 			break;
 		default:
-			goto fail;
 			break;
 		}
+		break;
 	}
-
-	if (ATA_12 == ata_cmd[0]) {
-		switch (ata_cmd[9]) {
+	case ATA_12: { /* ATA_12 pass-through (0xA1) */
+		switch (scsi_cmd[9]) { /* ATA Command */
 		case 0xEC: /* Identify Device */
 			rc = 0;
 			break;
 		default:
-			goto fail;
 			break;
 		}
+		break;
 	}
-fail:
+
+	default:
+		break;
+	}
+
 	return rc;
 
 }
@@ -187,7 +180,13 @@ int td_cmd_gen_SEC_dup (struct td_engine *eng, struct td_token *tok)
 	return 0;
 }
 
-static inline void td_error_decode_ssd_err(uint64_t xs)
+/*
+ * Process an SSD error
+ * RETURN VALUE:
+ *    0 - Error handled OK, continue
+ *    1 - Errir is fatal, device is DEAD
+ */
+static inline int td_process_ssd_error(struct td_engine *eng, uint64_t xs)
 {
 	/*
 	 * ISR Status (0-7):
@@ -198,9 +197,9 @@ static inline void td_error_decode_ssd_err(uint64_t xs)
 	 * 4:            Host Bus Data Error (HBDS)
 	 * 5:            Host Bus Fatal Error (HBFS)
 	 * 6:            Task File Error Status (TFES)
-	 * 7:            Rsvd
+	 * 7:            PHY Ready Change Status (PRCS)
 	 *
-	 * PxSerr (8-31)
+	 * PxSerr (8-13)
 	 * Err:
 	 * 8:            Recovered Data Integrity Error (I)
 	 * 9:            Recovered Communications Error (M)
@@ -221,83 +220,90 @@ static inline void td_error_decode_ssd_err(uint64_t xs)
 	 * 22:          Transport State transition Error (T)
 	 * 23:          Unknown FIS Type (F)
 	 * 24:          Exchanged (X)
+	 * 25-30:    Rsvd
 	 *
-	 * 25-31:    Rsvd
+	 * 30:          Non-fatal error, can continue
+	 * 31:          Port Connect Change Status (PCS)
 	 *
 	 * Taskfile Register (32-63)
 	 */
 
-	pr_err("SSD Error debug: \n");
+	td_eng_err(eng, "FW Flash error bits: \n");
 	if (xs & 0x1 << 0)
-		pr_err(" Unkown FIS Interrupt bit set.\n");
+		td_eng_err(eng, " Unkown FIS Interrupt bit set.\n");
 	if (xs & 0x1 << 1)
-		pr_err(" OverFlow (OFS)\n");
+		td_eng_err(eng, " OverFlow (OFS)\n");
 	if (xs & 0x1 << 2)
-		pr_err(" Interface Non Fatal (INFS)\n");
+		td_eng_err(eng, " Interface Non Fatal (INFS)\n");
 	if (xs & 0x1 << 3)
-		pr_err(" Interface Fatal (IFS)\n");
+		td_eng_err(eng, " Interface Fatal (IFS)\n");
 	if (xs & 0x1 << 4)
-		pr_err(" Host Bus Data Error (HBDS)\n");
+		td_eng_err(eng, " Host Bus Data Error (HBDS)\n");
 	if (xs & 0x1 << 5)
-		pr_err(" Host Bus Fatal Error (HBFS)\n");
+		td_eng_err(eng, " Host Bus Fatal Error (HBFS)\n");
 	if (xs & 0x1 << 6)
-		pr_err(" Task File Error Status (TFES)\n");
+		td_eng_err(eng, " Task File Error Status (TFES)\n");
 	if (xs & 0x1 << 7)
-		pr_err(" PHY Ready Change Status (PRCS)\n");
+		td_eng_err(eng, " PHY Ready Change Status (PRCS)\n");
 
 	if (xs & 0x1 << 8)
-		pr_err(" Recovered Data Integrity Error (I)\n");
+		td_eng_err(eng, " Recovered Data Integrity Error (I)\n");
 	if (xs & 0x1 << 9)
-		pr_err(" Recovered Communications Error (M)\n");
+		td_eng_err(eng, " Recovered Communications Error (M)\n");
 	if (xs & 0x1 << 10)
-		pr_err(" Transient Data Integrity Error (T)\n");
+		td_eng_err(eng, " Transient Data Integrity Error (T)\n");
 	if (xs & 0x1 << 11)
-		pr_err(" Persistent Communication or Data Integrity Error (C)\n");
+		td_eng_err(eng, " Persistent Communication or Data Integrity Error (C)\n");
 	if (xs & 0x1 << 12)
-		pr_err(" Protocol Error (P)\n");
+		td_eng_err(eng, " Protocol Error (P)\n");
 	if (xs & 0x1 << 13)
-		pr_err(" Internal Error (E)\n");
+		td_eng_err(eng, " Internal Error (E)\n");
 	if (xs & 0x1 << 14)
-		pr_err(" PhyRdy Change (N\n");
+		td_eng_err(eng, " PhyRdy Change (N\n");
 	if (xs & 0x1 << 15)
-		pr_err(" Phy Internal Error (I)\n");
+		td_eng_err(eng, " Phy Internal Error (I)\n");
 	if (xs & 0x1 << 16)
-		pr_err(" Comm Wake (W)\n");
+		td_eng_err(eng, " Comm Wake (W)\n");
 	if (xs & 0x1 << 17)
-		pr_err(" 10B to 8B Decode Error (B)\n");
+		td_eng_err(eng, " 10B to 8B Decode Error (B)\n");
 	if (xs & 0x1 << 18)
-		pr_err(" Disparity Error (D)\n");
+		td_eng_err(eng, " Disparity Error (D)\n");
 	if (xs & 0x1 << 19)
-		pr_err(" CRC Error (C)\n");
+		td_eng_err(eng, " CRC Error (C)\n");
 	if (xs & 0x1 << 20)
-		pr_err(" Handshake Error (H)\n");
+		td_eng_err(eng, " Handshake Error (H)\n");
 	if (xs & 0x1 << 21)
-		pr_err(" Link Sequence Error (S)\n");
+		td_eng_err(eng, " Link Sequence Error (S)\n");
 	if (xs & 0x1 << 22)
-		pr_err(" Transport State transition Error (T)\n");
+		td_eng_err(eng, " Transport State transition Error (T)\n");
 	if (xs & 0x1 << 23)
-		pr_err(" Unknown FIS Type (F)\n");
+		td_eng_err(eng, " Unknown FIS Type (F)\n");
 	if (xs & 0x1 << 24)
-		pr_err(" Exchanged (X)\n");
+		td_eng_err(eng, " Exchanged (X)\n");
 /*
 	if (xs & 0x1 << 25)
-		pr_err(" Rsvd\n");
+		td_eng_err(eng, " Rsvd\n");
 	if (xs & 0x1 << 26)
-		pr_err(" Rsvd\n");
+		td_eng_err(eng, " Rsvd\n");
 	if (xs & 0x1 << 27)
-		pr_err(" Rsvd\n");
+		td_eng_err(eng, " Rsvd\n");
 	if (xs & 0x1 << 28)
-		pr_err(" Rsvd\n");
+		td_eng_err(eng, " Rsvd\n");
 	if (xs & 0x1 << 29)
-		pr_err(" Rsvd\n");
-	if (xs & 0x1 << 30)
-		pr_err(" Rsvd\n");
+		td_eng_err(eng, " Rsvd\n");
 */
 	if (xs & 0x1 << 31)
-		pr_err(" Port Connect Change Status (PCS)\n");
+		td_eng_err(eng, " Port Connect Change Status (PCS)\n");
 
-	pr_err("Taskfile register contained 0x%08X\n", (uint32_t)(xs >> 32));
+	td_eng_err(eng, "Taskfile register contained 0x%08X\n", (uint32_t)(xs >> 32));
 
+	if (xs & 0x1<<30) {
+		td_eng_err(eng, " Error is non-fatal, continuing\n");
+		return 0;
+	}
+
+	/* By default, everything is fatal */
+	return 1;
 }
 
 static inline uint32_t td_cmd_status_timeout(struct td_engine *eng,
@@ -360,7 +366,7 @@ static int __td_cmd_fcode_handling (struct td_engine *eng,
 		tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
 		break;
 	case TD_CMD_HWF_XSUM:
-		eng->td_counters.token.badxsum_cnt ++;
+		td_eng_counter_token_inc(eng, BADXSUM_CNT);
 		td_eng_debug(eng, "  HW DMA XSUM %016llx\n", xs);
 		if (td_eng_conf_var_get(eng, XSUM_ERR_RETRIES))
 			tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
@@ -368,33 +374,33 @@ static int __td_cmd_fcode_handling (struct td_engine *eng,
 
 	case TD_CMD_HWF_TIMEOUT:
 		td_eng_debug(eng, "  HW WEP timeout %016llx\n", xs);
-		eng->td_counters.token.weptimeout_cnt ++;
+		td_eng_counter_token_inc(eng, WEPTIMEOUT_CNT);
 		if (td_eng_conf_var_get(eng, WEP_TIMEOUT_RETRIES))
 			tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 		break;
 
 	case TD_CMD_HWF_DATAECC:
 		td_eng_err(eng, "  HW WEP ECC %016llx\n", xs);
-		eng->td_counters.token.data_ecc_error_cnt ++;
+		td_eng_counter_token_inc(eng, DATA_ECC_ERROR_CNT);
 		tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 		break;
 
 	case TD_CMD_HWF_CMDOFFSET:
 		td_eng_err(eng, "  HW CMD offset %016llx\n", xs);
-		eng->td_counters.token.offset_error_cnt ++;
+		td_eng_counter_token_inc(eng, OFFSET_ERROR_CNT);
 		tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 		break;
 
 	case TD_CMD_HWF_CMDECC:
 		td_eng_err(eng, "  HW CMD ECC %016llx\n", xs);
-		eng->td_counters.token.cmd_ecc_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ECC_ERROR_CNT);
 		tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 		break;
 
 
 	case TD_CMD_HWF_HWCMD:
 	default:
-		eng->td_counters.token.cmd_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 		td_eng_err(eng, "  unknown extended status %016llx\n", xs);
 		tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 	}
@@ -469,7 +475,7 @@ static int td_lost_command_refresh(struct td_engine *eng,
 
 	td_engine_update_token_sent_timestamps(eng, tok);
 
-	eng->td_counters.token.lost_refresh_cnt ++;
+	td_eng_counter_token_inc(eng, LOST_REFRESH_CNT);
 
 	return 1;
 }
@@ -525,7 +531,7 @@ common_timeout_handling:
 		uint64_t timeout;
 
 		/* this is a pre-mature timeout, for OOO */
-		eng->td_counters.token.seq_replay_cnt ++;
+		td_eng_counter_token_inc(eng, SEQ_REPLAY_CNT);
 
 		td_eng_debug(eng, "re-push missing tok %u cmd %16llx status %02x\n",
 				tok->tokid, tok->cmd_bytes[0], st.byte);
@@ -563,7 +569,7 @@ common_timeout_handling:
 			gstatus.fw);
 	}
 
-	eng->td_counters.token.timedout_cnt ++;
+	td_eng_counter_token_inc(eng, TIMEDOUT_CNT);
 	tok->result = TD_TOK_RESULT_TIMEOUT;
 
 #ifdef CONFIG_TERADIMM_RDBUF_TRACKING
@@ -686,7 +692,7 @@ int td_replay_command_on_ooo_token(struct td_token *tok, uint8_t last_status_byt
 	for_each_token_list_token(otok, nxt, act_tok_list) {
 		ocmd = (void*)&otok->cmd_bytes;
 		if (ocmd->cmd.seq == (xs >> 32)) {
-			eng->td_counters.token.seq_replay_cnt ++;
+			td_eng_counter_token_inc(eng, SEQ_REPLAY_CNT);
 			++ found;
 			td_eng_debug(eng, "re-pushing token %u [%llx] #%u\n", 
 					otok->tokid, ocmd->cmd.u64, found);
@@ -758,7 +764,7 @@ static int td_cmd_status_bio_read (struct td_token *tok)
 			td_eng_err(eng, "SSD Warning, logging issue\n");
 			td_eng_err(eng, "Read warning tok %u cmd %016llx\n",
 						tok->tokid, tdcmd->cmd.u64);
-			td_error_decode_ssd_err(tok->last_xstatus);
+			td_process_ssd_error(eng, tok->last_xstatus);
 		}
 
 		/* READs are finished after _endread() happens later
@@ -800,7 +806,7 @@ static int td_cmd_status_bio_read (struct td_token *tok)
 		if (st.ext.extend) {
 			td_eng_hal_read_ext_status(eng, tok->tokid, &tok->last_xstatus, 1);
 			td_eng_trace(eng, TR_TOKEN, "TD_ENG:rd:status:xstatus   ", tok->last_xstatus);
-			td_error_decode_ssd_err(tok->last_xstatus);
+			td_process_ssd_error(eng, tok->last_xstatus);
 		}
 		/* Reset our timeout */
 		td_set_token_timeout(tok,
@@ -819,29 +825,33 @@ static int td_cmd_status_bio_read (struct td_token *tok)
 				st.byte,
 				tok->tokid);
 		tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
-		eng->td_counters.token.cmd_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 		return 1;
 
 	case TD_RD_STATUS_EXE_ERROR:
-		/* HALT Driver */
 		if (tdcmd->cmd.to_ssd) {
-			td_eng_err(eng, "SSD Error! Halting device!\n");
 			td_eng_err(eng, "FLASH Read Error %02x tok %u cmd %016llx\n",
-					st.byte, tok->tokid,
-					tdcmd->cmd.u64);
+					st.byte, tok->tokid, tdcmd->cmd.u64);
 			if (st.ext.extend) {
 				td_eng_hal_read_ext_status(eng, tok->tokid, &tok->last_xstatus, 1);
-				td_eng_trace(eng, TR_TOKEN, "TD_ENG:rd:status:xstatus   ", tok->last_xstatus);
-				td_error_decode_ssd_err(tok->last_xstatus);
-			}
 
-			tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
-		} else
-			tok->result = TD_TOK_RESULT_FAIL_ABORT;
+				/*
+				* We process the XSTATUS.  It will let us
+				* know if we can continue or if it's a hard
+				* failure
+				*/
+				if (td_process_ssd_error(eng, tok->last_xstatus)) {
+					td_eng_err(eng, "Fatal Flash Error! Halting device!\n");
+					tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
+					return 1;
+				}
+			}
+		}
+		tok->result = TD_TOK_RESULT_FAIL_ABORT;
 		return 1;
 
 	case TD_RD_STATUS_COLLISION:
-		eng->td_counters.token.cmd_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 		td_eng_warn(eng, "FLASH Read correctable error: collision %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid,
 				tok->cmd_bytes[0]);
@@ -850,7 +860,7 @@ static int td_cmd_status_bio_read (struct td_token *tok)
 		return 1;
 
 	case TD_RD_STATUS_FIELD_ERR:
-		eng->td_counters.token.cmd_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 		td_eng_warn(eng, "FLASH Read correctable field error %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid,
 				tok->cmd_bytes[0]);
@@ -859,7 +869,7 @@ static int td_cmd_status_bio_read (struct td_token *tok)
 		return 1;
 		
 	case TD_RD_STATUS_OoO_DUP_ERR:
-		eng->td_counters.token.seq_ooo_cnt ++;
+		td_eng_counter_token_inc(eng, SEQ_OOO_CNT);
 		td_eng_debug(eng, "FLASH Read correctable sequence error %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid,
 				tok->cmd_bytes[0]);
@@ -870,7 +880,7 @@ static int td_cmd_status_bio_read (struct td_token *tok)
 	case TD_RD_STATUS_OoO:
 		/* TODO: abstract this code into a function so it's shared
 		 * between read/write/control paths */
-		eng->td_counters.token.seq_ooo_cnt ++;
+		td_eng_counter_token_inc(eng, SEQ_OOO_CNT);
 		td_eng_debug(eng, "FLASH Read sequence hiccup %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid, tdcmd->cmd.u64);
 		td_eng_trace(eng, TR_TOKEN, "TD:sequence:rd:error", st.byte);
@@ -940,7 +950,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 			td_eng_err(eng, "SSD Warning, logging issue\n");
 			td_eng_err(eng, "FLASH Write warning tok %u cmd %016llx\n",
 						tok->tokid, tdcmd->cmd.u64);
-			td_error_decode_ssd_err(tok->last_xstatus);
+			td_process_ssd_error(eng, tok->last_xstatus);
 		}
 
 
@@ -950,9 +960,9 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 		tok->result = TD_TOK_RESULT_OK;
 
 		if (td->td_tok_retries[tok->tokid].bad_xsum)
-			eng->td_counters.token.badxsum_recovered_cnt ++;
+			td_eng_counter_token_inc(eng, BADXSUM_RECOVERED_CNT);
 		if (td->td_tok_retries[tok->tokid].wep_timeout)
-			eng->td_counters.token.weptimeout_recovered_cnt ++;
+			td_eng_counter_token_inc(eng, WEPTIMEOUT_RECOVERED_CNT);
 		return 1;
 	}
 
@@ -975,7 +985,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 		td_free_wr_buffers(eng, tok);
 
 		if (tok->host.bio && tok->ops.early_commit
-				&& td_bio_flags_ref(tok->host.bio)->commit_level
+				&& td_bio_flags_get_commitlevel(tok->host.bio)
 					>= td_cmd_status_commit(st) ) {
 
 			tok->ops.early_commit(tok, 0);
@@ -994,7 +1004,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 		if (st.ext.extend) {
 			td_eng_hal_read_ext_status(eng, tok->tokid, &tok->last_xstatus, 1);
 			td_eng_trace(eng, TR_TOKEN, "TD_ENG:wr:status:xstatus   ", tok->last_xstatus);
-			td_error_decode_ssd_err(tok->last_xstatus);
+			td_process_ssd_error(eng, tok->last_xstatus);
 		}
 		/* Reset our timeout */
 		td_set_token_timeout(tok,
@@ -1017,7 +1027,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 		/* Beta 4 style HW ECC */
 		td_eng_err(eng, "BETA ECC DATA error %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid, tdcmd->cmd.u64);
-		eng->td_counters.token.data_ecc_error_cnt ++;
+		td_eng_counter_token_inc(eng, DATA_ECC_ERROR_CNT);
 		if (td_eng_conf_var_get(eng, XSUM_ERR_RETRIES)) {
 			tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 			return 1;
@@ -1030,7 +1040,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 		td_eng_err(eng, "BETA ECC CMD error %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid, tdcmd->cmd.u64);
 		/* command failed ECC, increment, retry */
-		eng->td_counters.token.cmd_ecc_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ECC_ERROR_CNT);
 		if (td_eng_conf_var_get(eng, XSUM_ERR_RETRIES)) {
 			tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 			return 1;
@@ -1042,18 +1052,24 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 	case TD_WR_STATUS_EXE_ERROR:
 		if (tdcmd->cmd.to_ssd)
 		{
-			/* HALT Driver */
-			td_eng_err(eng, "SSD Error! Halting device!\n");
 			td_eng_err(eng, "FLASH Write Error %02x tok %u cmd %016llx\n",
-					st.byte, tok->tokid,
-				tdcmd->cmd.u64);
+					st.byte, tok->tokid, tdcmd->cmd.u64);
 			if (st.ext.extend) {
 				td_eng_hal_read_ext_status(eng, tok->tokid, &tok->last_xstatus, 1);
-				td_error_decode_ssd_err(tok->last_xstatus);
+				td_eng_trace(eng, TR_TOKEN, "TD_ENG:wr:status:xstatus   ", tok->last_xstatus);
+				/*
+				 * We process the XSTATUS.  It will let us
+				 * know if we can continue or if it's a hard
+				 * failure
+				 */
+				if (td_process_ssd_error(eng, tok->last_xstatus)) {
+					td_eng_err(eng, "Fatal Flash Error! Halting device!\n");
+					tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
+					return 1;
+				}
 			}
-			tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
-		} else
-			tok->result = TD_TOK_RESULT_FAIL_ABORT;
+		}
+		tok->result = TD_TOK_RESULT_FAIL_ABORT;
 
 		return 1;
 
@@ -1061,7 +1077,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 		/* this error is issued on a write command which fails
 			* checksum, it's possible that the data was held in the
 			* write back buffer... try to send it again. */
-		eng->td_counters.token.badxsum_cnt ++;
+		td_eng_counter_token_inc(eng, BADXSUM_CNT);
 		if (td_eng_conf_var_get(eng, XSUM_ERR_RETRIES)) {
 			td_eng_err(eng, "BETA correctable write xsum error %02x tok %u cmd %016llx\n",
 					st.byte, tok->tokid,
@@ -1086,7 +1102,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 		return 1;
 
 	case TD_STATUS_COLLISION:
-		eng->td_counters.token.cmd_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 		td_eng_err(eng, "FLASH Write: Command collision error %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid,
 				tok->cmd_bytes[0]);
@@ -1095,7 +1111,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 		return 1;
 
 	case TD_STATUS_FIELD_ERR:
-		eng->td_counters.token.cmd_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 		td_eng_trace(eng, TR_TOKEN, "TD:field_err:tok", tok->tokid);
 		if (! tok->host.bio) {
 			/*
@@ -1128,7 +1144,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 			return 1;
 		}
 		
-		eng->td_counters.token.seq_dup_cnt ++;
+		td_eng_counter_token_inc(eng, SEQ_DUP_CNT);
 		if (tok->host.bio) {
 			tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 			return 1;
@@ -1147,7 +1163,7 @@ static int td_cmd_status_bio_write (struct td_token *tok)
 	case TD_STATUS_OoO:
 		/* TODO: abstract this code into a function so it's shared
 		 * between read/write/control paths */
-		eng->td_counters.token.seq_ooo_cnt ++;
+		td_eng_counter_token_inc(eng, SEQ_OOO_CNT);
 		td_eng_debug(eng, "FLASH Write sequence hiccup %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid, tdcmd->cmd.u64);
 		td_eng_trace(eng, TR_TOKEN, "TD:sequence:wr:error", st.byte);
@@ -1214,7 +1230,7 @@ int td_cmd_status_check(struct td_token *tok)
 	/* we saw a status update with the correct polarity */
 	td_token_received_update(eng, tok);
 
-	/* handle extended status */
+	/* handle extended status fin.extend and ext.extend are the same*/
 	if (st.fin.extend) {
 		td_eng_hal_read_ext_status(eng, tok->tokid, &tok->last_xstatus, 1);
 		td_eng_trace(eng, TR_TOKEN, "TD_ENG:status:xstatus", tok->last_xstatus);
@@ -1255,7 +1271,7 @@ int td_cmd_status_check(struct td_token *tok)
 			td_free_wr_buffers(eng, tok);
 
 			if (tok->host.bio && tok->ops.early_commit
-					&& td_bio_flags_ref(tok->host.bio)->commit_level
+					&& td_bio_flags_get_commitlevel(tok->host.bio)
 						>= td_cmd_status_commit(st) ) {
 
 				tok->ops.early_commit(tok, 0);
@@ -1265,7 +1281,7 @@ int td_cmd_status_check(struct td_token *tok)
 
 		case TD_WR_STATUS_HDATA_ECC_ERR:
 			/* write data failed ECC, increment, retry */
-			eng->td_counters.token.data_ecc_error_cnt ++;
+			td_eng_counter_token_inc(eng, DATA_ECC_ERROR_CNT);
 			if (td_eng_conf_var_get(eng, XSUM_ERR_RETRIES)) {
 				tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 				return 1;
@@ -1276,7 +1292,7 @@ int td_cmd_status_check(struct td_token *tok)
 
 		case TD_WR_STATUS_HCMD_ECC_ERR:
 			/* command failed ECC, increment, retry */
-			eng->td_counters.token.cmd_ecc_error_cnt ++;
+			td_eng_counter_token_inc(eng, CMD_ECC_ERROR_CNT);
 			if (td_eng_conf_var_get(eng, XSUM_ERR_RETRIES)) {
 				tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 				return 1;
@@ -1286,21 +1302,23 @@ int td_cmd_status_check(struct td_token *tok)
 			return 1;
 
 		case TD_WR_STATUS_EXE_ERROR:
-			if (tdcmd->cmd.to_ssd)
-			{
-				/* HALT Driver */
-				uint64_t xs = 0;
-
-				td_eng_err(eng, "SSD Error! Halting device!\n");
-				td_eng_err(eng, "Write Error %02x tok %u cmd %016llx\n",
-						st.byte, tok->tokid,
-					tdcmd->cmd.u64);
-				td_eng_hal_read_ext_status(eng, tok->tokid, &xs, 1);
-				td_error_decode_ssd_err(xs);
-				tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
-			} else
-				tok->result = TD_TOK_RESULT_FAIL_ABORT;
-
+			if (tdcmd->cmd.to_ssd) {
+				td_eng_err(eng, "FLASH Write Error %02x tok %u cmd %016llx\n",
+						st.byte, tok->tokid, tdcmd->cmd.u64);
+				if (st.ext.extend) {
+					/*
+					* We process the XSTATUS.  It will let us
+					* know if we can continue or if it's a hard
+					* failure
+					*/
+					if (td_process_ssd_error(eng, tok->last_xstatus)) {
+						td_eng_err(eng, "Fatal Flash Error! Halting device!\n");
+						tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
+						return 1;
+					}
+				}
+			}
+			tok->result = TD_TOK_RESULT_FAIL_ABORT;
 			return 1;
 
 		case TD_WR_STATUS_SSD_WARNING:
@@ -1310,7 +1328,7 @@ int td_cmd_status_check(struct td_token *tok)
 			{
 				uint64_t xs = 0;
 				td_eng_hal_read_ext_status(eng, tok->tokid, &xs, 1);
-				td_error_decode_ssd_err(xs);
+				td_process_ssd_error(eng, xs);
 			}
 			break;
 
@@ -1318,7 +1336,7 @@ int td_cmd_status_check(struct td_token *tok)
 			/* this error is issued on a write command which fails
 			 * checksum, it's possible that the data was held in the
 			 * write back buffer... try to send it again. */
-			eng->td_counters.token.badxsum_cnt ++;
+			td_eng_counter_token_inc(eng, BADXSUM_CNT);
 			if (td_eng_conf_var_get(eng, XSUM_ERR_RETRIES)) {
 				td_eng_err(eng, "correctable write error %02x tok %u cmd %016llx\n",
 						st.byte, tok->tokid,
@@ -1377,7 +1395,7 @@ int td_cmd_status_check(struct td_token *tok)
 			{
 				uint64_t xs = 0;
 				td_eng_hal_read_ext_status(eng, tok->tokid, &xs, 1);
-				td_error_decode_ssd_err(xs);
+				td_process_ssd_error(eng, xs);
 			}
 			break;
 
@@ -1393,7 +1411,7 @@ int td_cmd_status_check(struct td_token *tok)
 					st.byte,
 					tok->tokid);
 			tok->result = TD_TOK_RESULT_FAIL_ABORT;
-			eng->td_counters.token.cmd_error_cnt ++;
+			td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 			return 1;
 
 		case TD_RD_STATUS_OoO_DUP_ERR:
@@ -1401,25 +1419,27 @@ int td_cmd_status_check(struct td_token *tok)
 					st.byte,
 					tok->tokid);
 			tok->result = TD_TOK_RESULT_FAIL_ABORT;
-			eng->td_counters.token.seq_dup_cnt ++;
+			td_eng_counter_token_inc(eng, SEQ_DUP_CNT);
 			return 1;
 
 		case TD_RD_STATUS_EXE_ERROR:
-			/* HALT Driver */
 			if (tdcmd->cmd.to_ssd) {
-				td_eng_err(eng, "SSD Error! Halting device!\n");
-				td_eng_err(eng, "Read Error %02x tok %u cmd %016llx\n",
-						st.byte, tok->tokid,
-						tdcmd->cmd.u64);
-				{
-					uint64_t xs = 0;
-					td_eng_hal_read_ext_status(eng, tok->tokid, &xs, 1);
-					td_error_decode_ssd_err(xs);
+				td_eng_err(eng, "FLASH Read Error %02x tok %u cmd %016llx\n",
+						st.byte, tok->tokid, tdcmd->cmd.u64);
+				if (st.ext.extend) {
+					/*
+					* We process the XSTATUS.  It will let us
+					* know if we can continue or if it's a hard
+					* failure
+					*/
+					if (td_process_ssd_error(eng, tok->last_xstatus)) {
+						td_eng_err(eng, "Fatal Flash Error! Halting device!\n");
+						tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
+						return 1;
+					}
 				}
-
-				tok->result = TD_TOK_RESULT_FAIL_ABORT_HARD;
-			} else
-				tok->result = TD_TOK_RESULT_FAIL_ABORT;
+			}
+			tok->result = TD_TOK_RESULT_FAIL_ABORT;
 			return 1;
 		}
 	} else {
@@ -1459,7 +1479,7 @@ int td_cmd_status_check(struct td_token *tok)
 
 	switch (st.ext.status) {
 	case TD_STATUS_COLLISION:
-		eng->td_counters.token.cmd_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 		td_eng_err(eng, "FW: Command collision error %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid,
 				tok->cmd_bytes[0]);
@@ -1468,7 +1488,7 @@ int td_cmd_status_check(struct td_token *tok)
 		return 1;
 
 	case TD_STATUS_FIELD_ERR:
-		eng->td_counters.token.cmd_error_cnt ++;
+		td_eng_counter_token_inc(eng, CMD_ERROR_CNT);
 		td_eng_err(eng, "correctable cmd error %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid,
 				tok->cmd_bytes[0]);
@@ -1477,7 +1497,7 @@ int td_cmd_status_check(struct td_token *tok)
 		return 1;
 		
 	case TD_STATUS_OoO_DUP_ERR:
-		eng->td_counters.token.seq_dup_cnt ++;
+		td_eng_counter_token_inc(eng, SEQ_DUP_CNT);
 		if (tok->host.bio) {
 			tok->result = TD_TOK_RESULT_FAIL_CAN_RETRY;
 			return 1;
@@ -1496,7 +1516,7 @@ int td_cmd_status_check(struct td_token *tok)
 	case TD_STATUS_OoO:
 		/* TODO: abstract this code into a function so it's shared
 		 * between read/write/control paths */
-		eng->td_counters.token.seq_ooo_cnt ++;
+		td_eng_counter_token_inc(eng, SEQ_OOO_CNT);
 		td_eng_warn(eng, "Control sequence hiccup %02x tok %u cmd %016llx\n",
 				st.byte, tok->tokid, tdcmd->cmd.u64);
 		td_eng_trace(eng, TR_TOKEN, "TD:sequence:ctl:error", st.byte);
@@ -1575,24 +1595,23 @@ int td_cmd_gen_bio(struct td_engine *eng, struct td_token *tok)
 			 * WR_FINAL is the 4K optimized version.  Everything
 			 * must be 4K, and bcnt is 0
 			 */
-			tdcmd->cmd.id = TD_CMD_WR_FINAL;
-			tdcmd->cmd.port = tok->port;
-			tdcmd->cmd.to_ssd = 1;
-
-			tdcmd->cmd.decode.dupcheck = 1;
-			tdcmd->cmd.decode.from_host = 1;
-			tdcmd->cmd.decode.data_size = TD_DEC_DATA_4K;
+			uint8_t needs_meta;
 			if ( td_eng_conf_hw_var_get(eng, E2E_MODE) ||
 				   ( td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE) == 512
 				     && td_eng_conf_hw_var_get(eng, HW_SECTOR_METADATA)) )
-				tdcmd->cmd.decode.meta_size = TD_DEC_META_128;
+				needs_meta = true;
 			else
-				tdcmd->cmd.decode.meta_size = TD_DEC_META_NONE;
+				needs_meta = false;
 
-			tdcmd->src.bufid = (uint8_t)tok->core_bufid;
-			tdcmd->src.wep = tok->wr_bufid;
-			tdcmd->src.bcnt = 0;
-			tdcmd->dst.lba.lba = tok->lba;
+			td_eng_cmdgen(eng,
+					bio_write4k,
+					(void*)&tok->cmd_bytes,
+					tok->port,
+					tok->lba,
+					(uint8_t)tok->core_bufid,
+					needs_meta,
+					tok->wr_bufid);
+
 		} else {
 			/*
 			 * WR_EXT is 512B command. bcnt is how many
@@ -1636,7 +1655,7 @@ int td_cmd_gen_bio(struct td_engine *eng, struct td_token *tok)
 		}
 
 		if (tok->sec_buddy) {
-			switch (td_bio_flags_ref(bio)->commit_level) {
+			switch (td_bio_flags_get_commitlevel(bio)) {
 			case TD_SUPER_EARLY_COMMIT:
 				tdcmd->src.sec_mode = TD_SEC_MODE_DOUBLE;
 				break;
@@ -1680,23 +1699,21 @@ int td_cmd_gen_bio(struct td_engine *eng, struct td_token *tok)
 			* RD_PAGE is the 4K optimized version.  Everything must be
 			* 4K, and bcnt is 0
 			*/
-			tdcmd->cmd.id = TD_CMD_RD_PAGE;
-			tdcmd->cmd.port = tok->port;
-			tdcmd->cmd.to_ssd = 1;
-
-			tdcmd->cmd.decode.dupcheck = 1;
-			tdcmd->cmd.decode.to_host = 1;
-			tdcmd->cmd.decode.data_size = TD_DEC_DATA_4K;
+			uint8_t needs_meta;
 			if ( td_eng_conf_hw_var_get(eng, E2E_MODE) ||
 				   ( td_eng_conf_hw_var_get(eng, BIO_SECTOR_SIZE) == 512
 				     && td_eng_conf_hw_var_get(eng, HW_SECTOR_METADATA)) )
-				tdcmd->cmd.decode.meta_size = TD_DEC_META_128;
+				needs_meta = true;
 			else
-				tdcmd->cmd.decode.meta_size = TD_DEC_META_NONE;
+				needs_meta = false;
 
-			tdcmd->dst.bufid = (uint8_t)tok->core_bufid;
-			tdcmd->dst.bcnt = 0;
-			tdcmd->src.lba.lba = tok->lba;
+			td_eng_cmdgen(eng,
+					bio_read4k,
+					(void*)&tok->cmd_bytes,
+					tok->port,
+					tok->lba,
+					(uint8_t)tok->core_bufid,
+					needs_meta);
 		} else {
 			/*
 			* RD_EXT is the 512B version.  bcnt is how many
@@ -1795,6 +1812,10 @@ struct td_command_generator td_cmdgen_teradimm = {
 	._dealloc    = td_cmdgen_dealloc,
 
 	._ata        = td_cmdgen_ata,
+
+	._bio_read4k = td_cmdgen_bio_read4k,
+
+	._bio_write4k = td_cmdgen_bio_write4k,
 
 	._get_reg    = td_cmdgen_get_reg,
 	._put_reg    = td_cmdgen_put_reg,

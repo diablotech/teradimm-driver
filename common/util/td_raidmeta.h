@@ -13,7 +13,8 @@ struct __packed  tr_meta_data_struct {
 		uint64_t        csum;
 		uint64_t        version;
 		uint64_t        state;
-		uint64_t	unused[2];
+		uint64_t	generation;
+		uint64_t        unused;
 	} signature;
 
 	struct {
@@ -38,8 +39,11 @@ struct __packed  tr_meta_data_struct {
 		uint8_t         uuid[16];
 		uint32_t        state;
 		uint32_t        _reserved1;
-		uint64_t        generation;
-		uint64_t        _reserved2[4];
+		uint64_t        _reserved2;
+		uint64_t        _reserved3;
+		uint64_t        _reserved4;
+		uint64_t        _reserved5;
+		uint64_t        _reserved6;
 	} member[TR_META_DATA_MEMBERS_MAX];
 };
 

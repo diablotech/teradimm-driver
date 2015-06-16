@@ -78,6 +78,21 @@
 
 
 /*
+ * These are the public side of our manifest sign keys
+ */
+struct td_rsa_pub_key td_rsa_pub_keys[] = {
+	/* Pairs to construct RSA keys in hex*/
+	/* Modulus */
+	{"00cef09f0ccf8564e386e68b84e268307600e58cf6e6b1f6d678dad178a22e625f5dafd37d44e91c5be118f7e6c3b00446074f770d50395b78a4ef20c2341d8d8c8d1dbce2f2020ff5c5a5a699e1a7441aced5c32c9129dcdc5063fa696c9c3fe1ccd32a2b258f2d81272666aded950f185571e13f34cc5c2a268e3f8d5208f894687033cd48b96e19ce83ee52d14cd0a359c88883492a6bcc41ce3bbc63faa85c436a190c1e93ee176535d5a90588a43aa1713d78d63a3f51d544739187931d949d90515293bcc7a7fc52c225542dd7c82ec47669003b1a698aaece5ea19878b7db4603e543fa83e6f2324a1221d6b846aa03860adf3f6317ea7b2229242d7471",
+		/* Exponent */
+		"10001"},
+/*	{"",
+		""},
+	{"",
+		""},*/
+};
+
+/*
  * Thankfully, we are x86_64 - Little Endian only
  */
 static inline uint32_t SHABLK0(struct td_sha1_context *ctx, int i)

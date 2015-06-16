@@ -96,6 +96,12 @@ error_no_ucmd:
 }
 
 
+int td_ucmd_map_virt(struct td_ucmd *ucmd, void* ptr)
+{
+	ucmd->data_page = NULL;
+	ucmd->data_virt = ptr;
+	return 0;
+}
 
 int td_ucmd_map(struct td_ucmd *ucmd,
 		struct task_struct *task, unsigned long addr)
@@ -150,10 +156,11 @@ void td_ucmd_unmap(struct td_ucmd *ucmd)
 		/* mark_page_accessed(ucmd->data_page); */
 		put_page(ucmd->data_page);
 	} else {
-		if (ucmd->data_page)
+		if (ucmd->data_page) {
 			__free_page(ucmd->data_page);
-		else
+		} else {
 			kfree(ucmd->data_virt);
+		}
 	}
 
 	ucmd->data_virt = NULL;
@@ -164,9 +171,8 @@ void td_ucmd_unmap(struct td_ucmd *ucmd)
 int td_ucmd_run(struct td_ucmd *ucmd, struct td_engine *eng)
 {
 	td_ucmd_ready(ucmd);
-	td_ucmd_get(ucmd);
 	td_enqueue_ucmd(eng, ucmd);
-	td_engine_poke(eng);
+	td_engine_sometimes_poke(eng);
 	return td_ucmd_wait(ucmd);
 }
 

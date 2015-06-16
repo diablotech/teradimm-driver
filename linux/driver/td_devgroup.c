@@ -72,9 +72,9 @@ static int check_always(struct td_devgroup *dg, uint32_t u1, uint64_t u2) {
 	return 0;
 }
 
-static int check_token_recompute(struct td_devgroup *dg, uint32_t u1, uint64_t u2)
+static int check_with_poke(struct td_devgroup *dg, uint32_t u1, uint64_t u2)
 {
-	atomic_set(&dg->dg_work_node.wn_token_recompute_needed, 1);
+	td_devgroup_poke(dg);
 	return 0;
 }
 
@@ -86,12 +86,12 @@ const struct td_dg_conf_var_desc td_dg_conf_general_var_desc[TD_DEVGROUP_CONF_GE
 };
 
 const struct td_dg_conf_var_desc td_dg_conf_worker_var_desc[TD_DEVGROUP_CONF_WORKER_MAX] = {
-	TD_DG_CONF_WORKER_ENTRY(MAX_OCCUPANCY,                 token_recompute,  1, UINT_MAX)
-	TD_DG_CONF_WORKER_ENTRY(EXTRA_TOKENS,                  token_recompute,  0, UINT_MAX)
+	TD_DG_CONF_WORKER_ENTRY(MAX_OCCUPANCY,                          always,  1, TD_WORK_ITEM_MAX_PER_NODE)
+	TD_DG_CONF_WORKER_ENTRY(EXTRA_TOKENS,                        with_poke,  0, UINT_MAX)
 	TD_DG_CONF_WORKER_ENTRY(MAX_LOOPS,                              always,  0, UINT_MAX)
 	TD_DG_CONF_WORKER_ENTRY(WITHOUT_DEVS_NSEC,                      always,  0, UINT_MAX)
-	TD_DG_CONF_WORKER_ENTRY(SHARE_NSEC,                             always,  0, UINT_MAX)
-	TD_DG_CONF_WORKER_ENTRY(RELEASE_NSEC,                           always,  0, UINT_MAX)
+	TD_DG_CONF_WORKER_ENTRY(IDLE_SHARE_NSEC,                        always,  0, UINT_MAX)
+	TD_DG_CONF_WORKER_ENTRY(BUSY_SHARE_NSEC,                        always,  0, UINT_MAX)
 	TD_DG_CONF_WORKER_ENTRY(FORCE_RELEASE_NSEC,                     always,  0, UINT_MAX)
 	TD_DG_CONF_WORKER_ENTRY(DEV_IDLE_JIFFIES,                       always,  0, UINT_MAX)
 	TD_DG_CONF_WORKER_ENTRY(DEV_WAIT_JIFFIES,                       always,  0, UINT_MAX)
@@ -151,10 +151,10 @@ static int __td_devgroup_start(struct td_devgroup *dg)
 
 #ifdef CONFIG_TERADIMM_OFFLOAD_COMPLETION_THREAD
 	dg->dg_endio_task = kthread_create(td_devgroup_endio, dg,
-			TD_DEVGROUP_THREAD_NAME_PREFIX "%s/endio",
+			TD_THREAD_NAME_PREFIX "%s/endio",
 			dg->dg_name);
 	if (unlikely(IS_ERR_OR_NULL(dg->dg_endio_task))) {
-		pr_err("Failed "TD_DEVGROUP_THREAD_NAME_PREFIX "%s/endio "
+		pr_err("Failed "TD_THREAD_NAME_PREFIX "%s/endio "
 				"thread creation: err=%ld\n", dg->dg_name,
 				PTR_ERR(dg->dg_endio_task));
 		rc = PTR_ERR(dg->dg_endio_task) ?: -EFAULT;
@@ -165,7 +165,7 @@ static int __td_devgroup_start(struct td_devgroup *dg)
 #endif
 
 
-	rc = td_work_node_init(&dg->dg_work_node, dg);
+	rc = td_work_node_init(&dg->dg_work_node, dg, dg->dg_socket);
 	if (rc < 0)
 		return rc;
 
@@ -199,7 +199,7 @@ static int __td_devgroup_stop(struct td_devgroup *dg)
 	if (dg->dg_endio_task) {
 		kthread_stop(dg->dg_endio_task);
 		dg->dg_endio_task = NULL;
-		pr_warn("Stopped endio thread "TD_DEVGROUP_THREAD_NAME_PREFIX "%s/endio\n",
+		pr_warn("Stopped endio thread "TD_THREAD_NAME_PREFIX "%s/endio\n",
 			dg->dg_name);
 	}
 #endif
@@ -221,10 +221,6 @@ static struct td_devgroup *__td_devgroup_create(const char *name, int socket,
 
 	strncpy(dg->dg_name, name, TD_DEVGROUP_NAME_MAX);
 
-#ifndef TERADIMM_CONFIG_AVOID_EVENTS
-	init_waitqueue_head(&dg->dg_event);
-#endif
-
 	INIT_LIST_HEAD(&dg->dg_devs_list);
 	spin_lock_init(&dg->dg_devs_lock);
 
@@ -234,7 +230,6 @@ static struct td_devgroup *__td_devgroup_create(const char *name, int socket,
 #endif
 	spin_lock_init(&dg->dg_endio_lock);
 	bio_list_init(&dg->dg_endio_success);
-	bio_list_init(&dg->dg_endio_failure);
 #endif
 
 	mutex_init(&dg->dg_mutex);
@@ -256,8 +251,8 @@ static struct td_devgroup *__td_devgroup_create(const char *name, int socket,
 	td_dg_conf_worker_var_set(dg, EXTRA_TOKENS, TD_WORKER_EXTRA_TOKENS);
 	td_dg_conf_worker_var_set(dg, MAX_LOOPS, TD_WORKER_MAX_LOOPS);
 	td_dg_conf_worker_var_set(dg, WITHOUT_DEVS_NSEC, TD_WORKER_WITHOUT_DEVS_NSEC);
-	td_dg_conf_worker_var_set(dg, SHARE_NSEC, TD_WORKER_SHARE_NSEC);
-	td_dg_conf_worker_var_set(dg, RELEASE_NSEC, TD_WORKER_RELEASE_NSEC);
+	td_dg_conf_worker_var_set(dg, IDLE_SHARE_NSEC, TD_WORKER_IDLE_SHARE_NSEC);
+	td_dg_conf_worker_var_set(dg, BUSY_SHARE_NSEC, TD_WORKER_BUSY_SHARE_NSEC);
 	td_dg_conf_worker_var_set(dg, FORCE_RELEASE_NSEC, TD_WORKER_FORCE_RELEASE_NSEC);
 	td_dg_conf_worker_var_set(dg, DEV_IDLE_JIFFIES, TD_WORKER_DEV_IDLE_JIFFIES);
 	td_dg_conf_worker_var_set(dg, DEV_WAIT_JIFFIES, TD_WORKER_DEV_WAIT_JIFFIES);
@@ -767,6 +762,12 @@ int td_devgroup_get_counter(struct td_devgroup *dg,
 		reg = &dg->counters.endio[cntr_num];
 		break;
 
+	case TD_DEVGROUP_COUNTER_NODE:
+		if (cntr_num >= TD_DEVGROUP_NODE_COUNT_MAX)
+			goto bail;
+		reg = &dg->dg_work_node.counters[cntr_num];
+		break;
+
 	case TD_DEVGROUP_COUNTER_WORKER:
 		if (cntr_num >= TD_DEVGROUP_WORKER_COUNT_MAX)
 			goto bail;
@@ -880,14 +881,11 @@ bail:
  * @param eng    - the device
  * @param bio    - BIO to queue for completion
  */
-void td_devgroup_queue_endio(struct td_devgroup *dg, td_bio_ref bio, int result)
+void td_devgroup_queue_endio_success(struct td_devgroup *dg, td_bio_ref bio)
 {
 	spin_lock_bh(&dg->dg_endio_lock);
 
-	if (likely(result == 0))
-		bio_list_add(&dg->dg_endio_success, bio);
-	else
-		bio_list_add(&dg->dg_endio_failure, bio);
+	bio_list_add(&dg->dg_endio_success, bio);
 
 	dg->dg_endio_count ++;
 	if (dg->dg_endio_ts == 0)
@@ -905,13 +903,12 @@ unsigned __td_devgroup_do_endio (struct td_devgroup* dg)
 	unsigned count = 0;
 	unsigned long ts_delta;
 	td_bio_ref bio;
-	struct bio_list good, bad;
+	struct bio_list good;
 
 	if (dg == NULL || ! dg->dg_endio_count)
 		return 0;
 
 	bio_list_init(&good);
-	bio_list_init(&bad);
 
 	ts_delta = jiffies;
 	/* Grab the lock */
@@ -926,11 +923,6 @@ unsigned __td_devgroup_do_endio (struct td_devgroup* dg)
 	bio_list_merge(&good, &dg->dg_endio_success);
 	bio_list_init(&dg->dg_endio_success);
 
-	/* Stash bad ones */
-	bio_list_merge(&bad, &dg->dg_endio_failure);
-	bio_list_init(&dg->dg_endio_failure);
-
-
 	dg->dg_endio_count = 0;
 	dg->dg_endio_ts = 0;
 
@@ -944,12 +936,10 @@ unsigned __td_devgroup_do_endio (struct td_devgroup* dg)
 	/* Now we complete things, good first */
 	while((bio = bio_list_pop(&good))) {
 		count++;
+#ifdef CONFIG_TERADIMM_BIO_FTRACE
+		trace_printk("TD %s endio endio good\n", dg->dg_name);
+#endif
 		td_bio_complete_success(bio);
-	}
-
-	while((bio = bio_list_pop(&bad))) {
-		count++;
-		td_bio_complete_failure(bio);
 	}
 
 	td_dg_counter_var_endio_add(dg, DONE, count);

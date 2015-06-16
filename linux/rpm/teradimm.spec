@@ -12,7 +12,7 @@ BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 %endif
 
 %if "%{?tools}" != "none"
- %define tools  tdctl tdcmd
+ %define tools tdctl tdtst tdcmd
 %endif
 
 # If kversion isn't defined on the rpmbuild line, define it here.
@@ -45,7 +45,11 @@ Source0:  teradimm-%{RPMVER}.tar.gz
 %if "%{kversion}" != "none"
 
 %if %{is_rh}
+%if %(echo %{kversion} | grep -q el6uek;echo $?)
 BuildRequires: kernel-devel = %{kversion}
+%else
+BuildRequires: kernel-uek-devel = %{kversion}
+%endif
 %else
 BuildRequires: kernel-default-devel = %{kversion}
 %endif
@@ -184,6 +188,11 @@ echo DEST_BIN=%{buildroot}/usr/sbin > Makefile.conf
 %endif
   %{__make} -C "${KSRC}" modules_install M=$PWD/linux/driver
   ####make %{?_smp_mflags} KVERSION=%{kversion}.%{_target_cpu} -C linux/driver install-kmod
+%if %{is_rh}
+%if ! %(echo %{kversion} | grep -q el6uek;echo $?)
+  find %{buildroot}/lib/modules -iname 'modules.*' -exec rm {} \;
+%endif
+%endif
 %if "%{rh_version}" == "7"
   find %{buildroot}/lib/modules -iname 'modules.*' -exec rm {} \;
 %endif

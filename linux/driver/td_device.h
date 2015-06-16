@@ -85,6 +85,8 @@ struct td_device {
 
 	struct td_devgroup  *td_devgroup;    /**< part of this device group */
 	struct list_head    td_devgroup_link; /**< link in the groups list of devices */
+	
+	struct td_raid      *td_raid ;       /**< part of this raid group */
 
 	struct td_work_item *td_work_item;   /**< info for td_worker */
 
@@ -143,7 +145,8 @@ extern int td_device_list_iter(int (*action)(struct td_device *dev, void *data),
 extern int td_device_dump_names(char *buf, size_t len, uint32_t *count);
 extern int td_device_create(const char *name, const char *slot_name,
 		uint64_t phys_mem_base, uint64_t phys_mem_size,
-		uint32_t irq_num, uint16_t memspeed, uint16_t cpu_socket);
+		uint64_t avoid_mask, uint32_t irq_num, uint16_t memspeed,
+		uint16_t cpu_socket);
 extern int td_device_delete(const char *name);
 
 extern int td_device_shutdown(struct td_device *dev);
